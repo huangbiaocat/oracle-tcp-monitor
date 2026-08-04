@@ -1,0 +1,38 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install PyInstaller
+        run: python -m pip install pyinstaller
+      - name: Build single-file executable
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile `
+            --name OracleTCPMonitor_SingleFile `
+            --add-data "targets.json;." `
+            --add-data "web\index.html;web" `
+            app.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OracleTCPMonitor-Windows-x64
+          path: dist/OracleTCPMonitor_SingleFile.exe
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/OracleTCPMonitor_SingleFile.exe
