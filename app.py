@@ -59,7 +59,7 @@ stop_event = threading.Event()
 wake_event = threading.Event()
 round_lock = threading.Lock()
 state_lock = threading.Lock()
-state = {"running": True, "paused": False, "started_at": time.time(), "round": 0, "last_round_at": None,
+state = {"running": True, "paused": True, "awaiting_project": True, "started_at": time.time(), "round": 0, "last_round_at": None,
          "last_round_seconds": None, **INITIAL_SETTINGS}
 
 
@@ -97,7 +97,8 @@ def init_db():
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(targets)")}
         if "custom" not in columns:
             conn.execute("ALTER TABLE targets ADD COLUMN custom INTEGER NOT NULL DEFAULT 0")
-        conn.execute("INSERT OR IGNORE INTO projects(id,name,network_label,created_at) VALUES(1,'????','',?)", (utc_now(),))
+        if conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0:
+            conn.execute("INSERT INTO projects(name,network_label,created_at) VALUES('????','',?)", (utc_now(),))
         result_columns = {row["name"] for row in conn.execute("PRAGMA table_info(results)")}
         if "project_id" not in result_columns:
             conn.execute("ALTER TABLE results ADD COLUMN project_id INTEGER NOT NULL DEFAULT 1")
@@ -180,7 +181,7 @@ def manage_projects(payload):
         with state_lock:
             state["project_id"], state["network_label"] = project_id, label
         save_current_settings()
-    elif action == "switch":
+    elif action in ("switch", "start"):
         try:
             project_id = int(payload.get("project_id"))
         except (TypeError, ValueError):
@@ -191,6 +192,49 @@ def manage_projects(payload):
             raise ValueError("???????")
         with state_lock:
             state["project_id"], state["network_label"] = project["id"], project["network_label"]
+            if action == "start":
+                state["awaiting_project"] = False
+                state["paused"] = False
+                state["running"] = True
+                state["started_at"] = time.time()
+        save_current_settings()
+    elif action == "update":
+        try:
+            project_id = int(payload.get("project_id"))
+        except (TypeError, ValueError):
+            raise ValueError("??????")
+        name = str(payload.get("name") or "").strip()
+        label = str(payload.get("network_label") or "").strip()[:80]
+        if not name or len(name) > 80:
+            raise ValueError("??????? 1 ? 80 ???")
+        with db() as conn:
+            if not conn.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
+                raise ValueError("???????")
+            try:
+                conn.execute("UPDATE projects SET name=?,network_label=? WHERE id=?", (name, label, project_id))
+            except sqlite3.IntegrityError:
+                raise ValueError("??????????")
+        with state_lock:
+            if state.get("project_id") == project_id:
+                state["network_label"] = label
+        save_current_settings()
+    elif action == "delete":
+        try:
+            project_id = int(payload.get("project_id"))
+        except (TypeError, ValueError):
+            raise ValueError("??????")
+        with round_lock:
+            with db() as conn:
+                if conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] <= 1:
+                    raise ValueError("????????????")
+                if not conn.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
+                    raise ValueError("???????")
+                conn.execute("DELETE FROM results WHERE project_id=?", (project_id,))
+                conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
+                fallback = conn.execute("SELECT id,network_label FROM projects ORDER BY id LIMIT 1").fetchone()
+        with state_lock:
+            if state.get("project_id") == project_id:
+                state["project_id"], state["network_label"] = fallback["id"], fallback["network_label"]
         save_current_settings()
     else:
         raise ValueError("????????")
@@ -363,6 +407,8 @@ def control(action):
         wake_event.set()
     elif action == "resume":
         with state_lock:
+            if state.get("awaiting_project"):
+                raise ValueError("????????")
             state["paused"] = False
             state["running"] = True
             duration_hours = state["duration_hours"]
