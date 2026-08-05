@@ -11,6 +11,7 @@ import socket
 import ssl
 import sqlite3
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -34,6 +35,7 @@ TIMEOUT = max(1.0, float(os.environ.get("TCP_TIMEOUT", "5")))
 DURATION_HOURS = max(0.0, float(os.environ.get("TCP_DURATION_HOURS", "48")))
 public_ip_cache = {"value": {}, "checked_at": 0.0}
 public_ip_lock = threading.Lock()
+local_network_cache = {"value": {}, "checked_at": 0.0}
 
 
 def load_settings():
@@ -85,7 +87,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS projects(
           id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
           network_label TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
-          detected_isp TEXT, detected_region TEXT, detected_city TEXT, last_public_ipv4 TEXT
+          detected_isp TEXT, detected_region TEXT, detected_city TEXT, last_public_ipv4 TEXT,
+          local_ssid TEXT
         );
         CREATE TABLE IF NOT EXISTS results(
           id INTEGER PRIMARY KEY AUTOINCREMENT, tested_at TEXT NOT NULL, region TEXT NOT NULL,
@@ -101,7 +104,7 @@ def init_db():
         if conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0:
             conn.execute("INSERT INTO projects(name,network_label,created_at) VALUES('默认项目','',?)", (utc_now(),))
         project_columns = {row["name"] for row in conn.execute("PRAGMA table_info(projects)")}
-        for name in ("detected_isp", "detected_region", "detected_city", "last_public_ipv4"):
+        for name in ("detected_isp", "detected_region", "detected_city", "last_public_ipv4", "local_ssid"):
             if name not in project_columns:
                 conn.execute(f"ALTER TABLE projects ADD COLUMN {name} TEXT")
         result_columns = {row["name"] for row in conn.execute("PRAGMA table_info(results)")}
@@ -164,7 +167,7 @@ def list_targets():
 
 def list_projects():
     with db() as conn:
-        projects = [dict(row) for row in conn.execute("SELECT id,name,network_label,created_at,detected_isp,detected_region,detected_city,last_public_ipv4 FROM projects ORDER BY id")]
+        projects = [dict(row) for row in conn.execute("SELECT id,name,network_label,created_at,detected_isp,detected_region,detected_city,last_public_ipv4,local_ssid FROM projects ORDER BY id")]
         result_times = conn.execute("SELECT project_id,tested_at FROM results ORDER BY project_id,tested_at").fetchall()
     with state_lock:
         current = state.get("project_id", 1)
@@ -186,30 +189,24 @@ def list_projects():
         project["sessions"] = sessions[-100:]
         project["collecting"] = bool(collecting and project["id"] == current)
     current_net = get_public_network().get("ipv4") or get_public_network().get("ipv6") or {}
+    current_ssid = get_local_network_identity().get("ssid")
     carrier = next((x for x in ("联通", "移动", "电信", "教育网") if x in current_net.get("isp", "")), "")
     region_key = current_net.get("region", "").replace("壮族自治区", "").replace("自治区", "").replace("省", "").replace("市", "")
     city_key = current_net.get("city", "").replace("市", "")
     best_score = 0
     for project in projects:
-        text = project["name"] + " " + project.get("network_label", "")
         score = 0
-        if project.get("detected_isp") == current_net.get("isp") and current_net.get("isp"):
-            score += 5
-        elif carrier and carrier in text:
-            score += 4
-        if project.get("detected_city") == current_net.get("city") and current_net.get("city"):
-            score += 4
-        elif city_key and city_key in text:
-            score += 3
-        if project.get("detected_region") == current_net.get("region") and current_net.get("region"):
-            score += 3
-        elif region_key and region_key in text:
-            score += 2
+        if current_ssid and project.get("local_ssid") == current_ssid:
+            score += 10
+            if project.get("detected_isp") == current_net.get("isp") and current_net.get("isp"):
+                score += 3
+            if project.get("detected_city") == current_net.get("city") and current_net.get("city"):
+                score += 2
         project["match_score"] = score
         best_score = max(best_score, score)
     for project in projects:
-        project["recommended"] = bool(best_score >= 4 and project["match_score"] == best_score)
-    return {"projects": projects, "current_project_id": current}
+        project["recommended"] = bool(best_score >= 10 and project["match_score"] == best_score)
+    return {"projects": projects, "current_project_id": current, "current_ssid": current_ssid}
 
 
 def manage_projects(payload):
@@ -246,10 +243,11 @@ def manage_projects(payload):
                 state["started_at"] = time.time()
         if action == "start":
             detected = get_public_network().get("ipv4") or get_public_network().get("ipv6") or {}
+            local_ssid = get_local_network_identity().get("ssid")
             with db() as conn:
-                conn.execute("UPDATE projects SET detected_isp=?,detected_region=?,detected_city=?,last_public_ipv4=? WHERE id=?",
+                conn.execute("UPDATE projects SET detected_isp=?,detected_region=?,detected_city=?,last_public_ipv4=?,local_ssid=COALESCE(local_ssid,?) WHERE id=?",
                              (detected.get("isp"), detected.get("region"), detected.get("city"),
-                              (get_public_network().get("ipv4") or {}).get("ip"), project_id))
+                              (get_public_network().get("ipv4") or {}).get("ip"), local_ssid, project_id))
         save_current_settings()
     elif action == "update":
         try:
@@ -587,6 +585,24 @@ def get_public_network():
         return value
 
 
+def get_local_network_identity():
+    now = time.time()
+    if now - local_network_cache["checked_at"] < 30:
+        return local_network_cache["value"]
+    value = {}
+    try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = subprocess.run(["netsh", "wlan", "show", "interfaces"], capture_output=True,
+                                text=True, errors="replace", timeout=4, creationflags=flags)
+        match = re.search(r"(?mi)^\s*SSID\s*:\s*(.+?)\s*$", result.stdout)
+        if match:
+            value["ssid"] = match.group(1).strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    local_network_cache.update(value=value, checked_at=now)
+    return value
+
+
 def network_info():
     hostname = socket.gethostname()
     ips = set()
@@ -615,6 +631,7 @@ def network_info():
     return {"hostname": hostname, "local_ips": sorted(ip for ip in ips if not ip.startswith("127.")),
             "public_ip": public_ip, "outbound_ip": public_ip,
             "public_network": public_network,
+            "local_network": get_local_network_identity(),
             "local_outbound_ip": local_outbound_ip, "proxy_environment": bool(proxy_vars),
             "proxy_variables": proxy_vars, "target_service": "Oracle Cloud Object Storage", "target_port": 443}
 
