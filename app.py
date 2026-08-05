@@ -23,7 +23,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 try:
     import webview
@@ -56,7 +56,7 @@ def load_settings():
     if not SETTINGS_PATH.exists():
         return defaults
     try:
-        saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8-sig"))
         return {
             "interval": max(5, min(86400, int(saved.get("interval", defaults["interval"])))),
             "timeout": max(0.1, min(120.0, float(saved.get("timeout", defaults["timeout"])))),
@@ -1035,6 +1035,53 @@ def csv_bytes(hours):
     return ("\ufeff" + out.getvalue()).encode("utf-8")
 
 
+def safe_filename(text):
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", str(text or ""))
+    cleaned = re.sub(r"\s+", "_", cleaned).strip("._")
+    return cleaned[:60] or "未命名"
+
+
+def export_filename(hours):
+    """CSV 文件名：项目名称_网络标注_数据起止时间（本机时间）"""
+    _, since = window_clause(hours)
+    with state_lock:
+        project_id = state.get("project_id", 1)
+    with db() as conn:
+        project = conn.execute("SELECT name,network_label FROM projects WHERE id=?", (project_id,)).fetchone()
+        stamps = [row[0] for row in conn.execute(
+            "SELECT tested_at FROM results WHERE tested_at>=? AND project_id=? ORDER BY tested_at",
+            (since, project_id))]
+    start_stamp = stamps[0] if stamps else since
+    end_stamp = stamps[-1] if stamps else utc_now()
+
+    def local(stamp):
+        try:
+            return datetime.fromisoformat(stamp).astimezone().strftime("%Y%m%d_%H%M")
+        except ValueError:
+            return datetime.now().strftime("%Y%m%d_%H%M")
+
+    name = safe_filename(project["name"] if project else "默认项目")
+    label = safe_filename(project["network_label"]) if project and project["network_label"] else ""
+    parts = [name] + ([label] if label else []) + [f"{local(start_stamp)}-{local(end_stamp)}"]
+    return "_".join(parts) + ".csv"
+
+
+def compare_filename(start, end):
+    start_iso, end_iso = parse_compare_range(start, end)
+
+    def local(stamp):
+        try:
+            return datetime.fromisoformat(stamp).astimezone().strftime("%Y%m%d_%H%M")
+        except ValueError:
+            return datetime.now().strftime("%Y%m%d_%H%M")
+
+    return f"oracle_tcp_对比_{local(start_iso)}-{local(end_iso)}.csv"
+
+
+def disposition(filename):
+    return f"attachment; filename=\"oracle_tcp_export.csv\"; filename*=UTF-8''{quote(filename)}"
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -1077,14 +1124,12 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == "/api/update/check":
                 self.send_data(check_update(force=want_refresh))
             elif url.path == "/api/export_compare.csv":
-                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 self.send_data(compare_csv(q.get("start", [""])[0], q.get("end", [""])[0], q.get("metric", ["avg"])[0]),
                   "text/csv; charset=utf-8",
-                  headers={"Content-Disposition": f'attachment; filename="oracle_tcp_compare_{stamp}.csv"'})
+                  headers={"Content-Disposition": disposition(compare_filename(q.get("start", [""])[0], q.get("end", [""])[0]))})
             elif url.path == "/api/export.csv":
-                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 self.send_data(csv_bytes(q.get("hours", [48])[0]), "text/csv; charset=utf-8",
-                  headers={"Content-Disposition": f'attachment; filename="oracle_tcp_{stamp}.csv"'})
+                  headers={"Content-Disposition": disposition(export_filename(q.get("hours", [48])[0]))})
             else:
                 self.send_data({"error":"not found"}, status=404)
         except Exception as exc:
