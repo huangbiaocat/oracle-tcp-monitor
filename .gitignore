@@ -3,6 +3,7 @@ __pycache__/
 *.db
 *.db-shm
 *.db-wal
+oracle_tcp_settings.json
 build/
 dist/
 *.spec
