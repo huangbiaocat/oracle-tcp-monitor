@@ -20,20 +20,38 @@ FROZEN = getattr(sys, "frozen", False)
 ROOT = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 ASSET_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
 DB_PATH = ROOT / "oracle_latency.db"
+SETTINGS_PATH = ROOT / "oracle_tcp_settings.json"
 TARGETS_PATH = ASSET_ROOT / "targets.json"
 WEB_PATH = ASSET_ROOT / "web" / "index.html"
-HOST, WEB_PORT = "127.0.0.1", 8765
+HOST, WEB_PORT = "127.0.0.1", int(os.environ.get("TCP_PORT", "8765"))
 INTERVAL = max(5, int(os.environ.get("TCP_INTERVAL", "60")))
 TIMEOUT = max(1.0, float(os.environ.get("TCP_TIMEOUT", "5")))
 DURATION_HOURS = max(0.0, float(os.environ.get("TCP_DURATION_HOURS", "48")))
+
+
+def load_settings():
+    defaults = {"interval": INTERVAL, "timeout": TIMEOUT, "duration_hours": DURATION_HOURS}
+    if not SETTINGS_PATH.exists():
+        return defaults
+    try:
+        saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        return {
+            "interval": max(5, min(86400, int(saved.get("interval", defaults["interval"])))),
+            "timeout": max(0.1, min(120.0, float(saved.get("timeout", defaults["timeout"])))),
+            "duration_hours": max(0.0, min(8760.0, float(saved.get("duration_hours", defaults["duration_hours"]))))
+        }
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return defaults
+
+
+INITIAL_SETTINGS = load_settings()
 
 stop_event = threading.Event()
 wake_event = threading.Event()
 round_lock = threading.Lock()
 state_lock = threading.Lock()
 state = {"running": True, "paused": False, "started_at": time.time(), "round": 0, "last_round_at": None,
-         "last_round_seconds": None, "interval": INTERVAL, "timeout": TIMEOUT,
-         "duration_hours": DURATION_HOURS}
+         "last_round_seconds": None, **INITIAL_SETTINGS}
 
 
 def utc_now():
@@ -76,8 +94,10 @@ async def probe(target):
     started = time.perf_counter()
     writer = None
     try:
+        with state_lock:
+            timeout = state["timeout"]
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(target["host"], target["port"]), timeout=TIMEOUT)
+            asyncio.open_connection(target["host"], target["port"]), timeout=timeout)
         latency = round((time.perf_counter() - started) * 1000, 2)
         ip = writer.get_extra_info("peername")[0] if writer.get_extra_info("peername") else None
         return (utc_now(), target["region"], latency, 1, ip, None)
@@ -106,7 +126,8 @@ def monitor_loop():
     while not stop_event.is_set():
         with state_lock:
             paused = state["paused"]
-            deadline = state["started_at"] + DURATION_HOURS * 3600 if DURATION_HOURS else None
+            duration_hours = state["duration_hours"]
+            deadline = state["started_at"] + duration_hours * 3600 if duration_hours else None
         if paused:
             wake_event.wait(1)
             wake_event.clear()
@@ -130,7 +151,9 @@ def monitor_loop():
         except Exception as exc:
             with state_lock:
                 state["error"] = f"{type(exc).__name__}: {exc}"
-        wait_for = max(0.2, INTERVAL - (time.perf_counter() - tick))
+        with state_lock:
+            interval = state["interval"]
+        wait_for = max(0.2, interval - (time.perf_counter() - tick))
         wake_event.wait(wait_for)
         wake_event.clear()
     with state_lock:
@@ -146,7 +169,8 @@ def control(action):
         with state_lock:
             state["paused"] = False
             state["running"] = True
-            if DURATION_HOURS and time.time() >= state["started_at"] + DURATION_HOURS * 3600:
+            duration_hours = state["duration_hours"]
+            if duration_hours and time.time() >= state["started_at"] + duration_hours * 3600:
                 state["started_at"] = time.time()
         wake_event.set()
     elif action == "restart":
@@ -163,6 +187,56 @@ def control(action):
         raise ValueError("unsupported action")
     with state_lock:
         return dict(state)
+
+
+def update_settings(payload):
+    try:
+        interval = int(payload.get("interval"))
+        timeout = float(payload.get("timeout"))
+        duration_hours = float(payload.get("duration_hours"))
+    except (TypeError, ValueError):
+        raise ValueError("参数必须是数字")
+    if not 5 <= interval <= 86400:
+        raise ValueError("检测间隔必须在 5 至 86400 秒之间")
+    if not 0.1 <= timeout <= 120:
+        raise ValueError("连接超时必须在 0.1 至 120 秒之间")
+    if not 0 <= duration_hours <= 8760:
+        raise ValueError("采集时长必须在 0 至 8760 小时之间；0 表示不限时")
+    settings = {"interval": interval, "timeout": timeout, "duration_hours": duration_hours}
+    SETTINGS_PATH.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    with state_lock:
+        was_finished = not state["running"]
+        state.update(settings)
+        if not state["paused"]:
+            state["running"] = True
+            if was_finished:
+                state["started_at"] = time.time()
+    wake_event.set()
+    with state_lock:
+        return dict(state)
+
+
+def network_info():
+    hostname = socket.gethostname()
+    ips = set()
+    try:
+        ips.update(x[4][0] for x in socket.getaddrinfo(hostname, None, socket.AF_INET))
+    except OSError:
+        pass
+    outbound_ip = None
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        outbound_ip = sock.getsockname()[0]
+        ips.add(outbound_ip)
+    except OSError:
+        pass
+    finally:
+        sock.close()
+    proxy_vars = [k for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy") if os.environ.get(k)]
+    return {"hostname": hostname, "local_ips": sorted(ip for ip in ips if not ip.startswith("127.")),
+            "outbound_ip": outbound_ip, "proxy_environment": bool(proxy_vars),
+            "proxy_variables": proxy_vars, "target_service": "Oracle Cloud Object Storage", "target_port": 443}
 
 
 def percentile(values, p):
@@ -222,13 +296,30 @@ def history(region, hours):
 
 
 def csv_bytes(hours):
-    _, since = window_clause(hours)
+    selected_hours, since = window_clause(hours)
     with db() as conn:
         rows = conn.execute("""SELECT r.tested_at,r.region,t.name,t.host,t.port,r.success,r.latency_ms,r.ip,r.error
           FROM results r JOIN targets t ON t.region=r.region WHERE r.tested_at>=?
           ORDER BY r.tested_at,r.region""", (since,)).fetchall()
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\n")
+    info = network_info()
+    with state_lock:
+        snapshot = dict(state)
+    writer.writerow(["Oracle TCP Monitor 导出信息"])
+    writer.writerow(["导出时间(本地)", datetime.now().astimezone().isoformat(timespec="seconds")])
+    writer.writerow(["测试用途", "当前所在地网络到甲骨文云（Oracle Cloud Infrastructure）各区域服务器的 TCP 连接速度"])
+    writer.writerow(["计算机名称", info["hostname"]])
+    writer.writerow(["本地出口IP", info["outbound_ip"] or "未知"])
+    writer.writerow(["本地IPv4", "; ".join(info["local_ips"]) or "未知"])
+    writer.writerow(["代理环境变量", "已检测到: " + ", ".join(info["proxy_variables"]) if info["proxy_environment"] else "未检测到"])
+    writer.writerow(["目标服务", info["target_service"]])
+    writer.writerow(["目标端口", info["target_port"]])
+    writer.writerow(["统计窗口(小时)", selected_hours])
+    writer.writerow(["检测间隔(秒)", snapshot["interval"]])
+    writer.writerow(["连接超时(秒)", snapshot["timeout"]])
+    writer.writerow(["采集时长(小时)", snapshot["duration_hours"], "0 表示不限时"])
+    writer.writerow([])
     writer.writerow(["检测时间(UTC)","区域标识","地区","地址","端口","成功","延迟ms","IP","错误"])
     writer.writerows(rows)
     return ("\ufeff" + out.getvalue()).encode("utf-8")
@@ -260,6 +351,7 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == "/api/status":
                 with state_lock: payload = dict(state)
                 payload["db_size_bytes"] = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+                payload["network"] = network_info()
                 self.send_data(payload)
             elif url.path == "/api/summary":
                 self.send_data(summary(q.get("hours", [24])[0]))
@@ -277,12 +369,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urlparse(self.path)
         try:
-            if url.path != "/api/control":
+            if url.path not in ("/api/control", "/api/settings"):
                 self.send_data({"error":"not found"}, status=404)
                 return
             length = min(4096, int(self.headers.get("Content-Length", "0")))
             payload = json.loads(self.rfile.read(length) or b"{}")
-            self.send_data(control(payload.get("action")))
+            if url.path == "/api/settings":
+                self.send_data(update_settings(payload))
+            else:
+                self.send_data(control(payload.get("action")))
         except (ValueError, json.JSONDecodeError) as exc:
             self.send_data({"error": str(exc)}, status=400)
         except Exception as exc:
@@ -295,7 +390,7 @@ def main():
     worker.start()
     server = ThreadingHTTPServer((HOST, WEB_PORT), Handler)
     print(f"Oracle TCP 延迟监控已启动：http://{HOST}:{WEB_PORT}")
-    print(f"检测间隔 {INTERVAL} 秒，TCP 超时 {TIMEOUT} 秒，计划时长 {DURATION_HOURS:g} 小时")
+    print(f"检测间隔 {state['interval']} 秒，TCP 超时 {state['timeout']} 秒，计划时长 {state['duration_hours']:g} 小时")
     if os.environ.get("TCP_OPEN_BROWSER", "1") != "0":
         threading.Timer(1.0, lambda: webbrowser.open(f"http://{HOST}:{WEB_PORT}")).start()
     try:
