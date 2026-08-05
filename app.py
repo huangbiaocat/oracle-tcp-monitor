@@ -84,7 +84,8 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS projects(
           id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
-          network_label TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+          network_label TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+          detected_isp TEXT, detected_region TEXT, detected_city TEXT, last_public_ipv4 TEXT
         );
         CREATE TABLE IF NOT EXISTS results(
           id INTEGER PRIMARY KEY AUTOINCREMENT, tested_at TEXT NOT NULL, region TEXT NOT NULL,
@@ -99,6 +100,10 @@ def init_db():
             conn.execute("ALTER TABLE targets ADD COLUMN custom INTEGER NOT NULL DEFAULT 0")
         if conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0:
             conn.execute("INSERT INTO projects(name,network_label,created_at) VALUES('????','',?)", (utc_now(),))
+        project_columns = {row["name"] for row in conn.execute("PRAGMA table_info(projects)")}
+        for name in ("detected_isp", "detected_region", "detected_city", "last_public_ipv4"):
+            if name not in project_columns:
+                conn.execute(f"ALTER TABLE projects ADD COLUMN {name} TEXT")
         result_columns = {row["name"] for row in conn.execute("PRAGMA table_info(results)")}
         if "project_id" not in result_columns:
             conn.execute("ALTER TABLE results ADD COLUMN project_id INTEGER NOT NULL DEFAULT 1")
@@ -159,9 +164,51 @@ def list_targets():
 
 def list_projects():
     with db() as conn:
-        projects = [dict(row) for row in conn.execute("SELECT id,name,network_label,created_at FROM projects ORDER BY id")]
+        projects = [dict(row) for row in conn.execute("SELECT id,name,network_label,created_at,detected_isp,detected_region,detected_city,last_public_ipv4 FROM projects ORDER BY id")]
+        result_times = conn.execute("SELECT project_id,tested_at FROM results ORDER BY project_id,tested_at").fetchall()
     with state_lock:
         current = state.get("project_id", 1)
+        gap_seconds = max(300, state.get("interval", 60) * 3)
+        collecting = not state.get("paused") and state.get("running")
+    grouped = {project["id"]: [] for project in projects}
+    for row in result_times:
+        grouped.setdefault(row["project_id"], []).append(row["tested_at"])
+    for project in projects:
+        sessions = []
+        for stamp in grouped.get(project["id"], []):
+            moment = datetime.fromisoformat(stamp)
+            if not sessions or (moment - datetime.fromisoformat(sessions[-1]["end"])).total_seconds() > gap_seconds:
+                sessions.append({"start": stamp, "end": stamp, "records": 1})
+            else:
+                sessions[-1]["end"] = stamp
+                sessions[-1]["records"] += 1
+        project["records"] = sum(item["records"] for item in sessions)
+        project["sessions"] = sessions[-100:]
+        project["collecting"] = bool(collecting and project["id"] == current)
+    current_net = get_public_network().get("ipv4") or get_public_network().get("ipv6") or {}
+    carrier = next((x for x in ("??", "??", "??", "???") if x in current_net.get("isp", "")), "")
+    region_key = current_net.get("region", "").replace("?????", "").replace("???", "").replace("?", "").replace("?", "")
+    city_key = current_net.get("city", "").replace("?", "")
+    best_score = 0
+    for project in projects:
+        text = project["name"] + " " + project.get("network_label", "")
+        score = 0
+        if project.get("detected_isp") == current_net.get("isp") and current_net.get("isp"):
+            score += 5
+        elif carrier and carrier in text:
+            score += 4
+        if project.get("detected_city") == current_net.get("city") and current_net.get("city"):
+            score += 4
+        elif city_key and city_key in text:
+            score += 3
+        if project.get("detected_region") == current_net.get("region") and current_net.get("region"):
+            score += 3
+        elif region_key and region_key in text:
+            score += 2
+        project["match_score"] = score
+        best_score = max(best_score, score)
+    for project in projects:
+        project["recommended"] = bool(best_score >= 4 and project["match_score"] == best_score)
     return {"projects": projects, "current_project_id": current}
 
 
@@ -197,6 +244,12 @@ def manage_projects(payload):
                 state["paused"] = False
                 state["running"] = True
                 state["started_at"] = time.time()
+        if action == "start":
+            detected = get_public_network().get("ipv4") or get_public_network().get("ipv6") or {}
+            with db() as conn:
+                conn.execute("UPDATE projects SET detected_isp=?,detected_region=?,detected_city=?,last_public_ipv4=? WHERE id=?",
+                             (detected.get("isp"), detected.get("region"), detected.get("city"),
+                              (get_public_network().get("ipv4") or {}).get("ip"), project_id))
         save_current_settings()
     elif action == "update":
         try:
