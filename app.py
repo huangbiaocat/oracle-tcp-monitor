@@ -1,15 +1,18 @@
 import asyncio
 import csv
 import io
+import ipaddress
 import json
 import math
 import os
+import re
 import socket
 import sqlite3
 import statistics
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -71,7 +74,7 @@ def init_db():
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS targets(
           region TEXT PRIMARY KEY, name TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL,
-          enabled INTEGER NOT NULL DEFAULT 1
+          enabled INTEGER NOT NULL DEFAULT 1, custom INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS results(
           id INTEGER PRIMARY KEY AUTOINCREMENT, tested_at TEXT NOT NULL, region TEXT NOT NULL,
@@ -81,13 +84,140 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_results_region_time ON results(region, tested_at);
         CREATE INDEX IF NOT EXISTS idx_results_time ON results(tested_at);
         """)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(targets)")}
+        if "custom" not in columns:
+            conn.execute("ALTER TABLE targets ADD COLUMN custom INTEGER NOT NULL DEFAULT 0")
         targets = json.loads(TARGETS_PATH.read_text(encoding="utf-8-sig"))
         for item in targets:
             region = item["region"]
             host = item.get("host", f"objectstorage.{region}.oraclecloud.com")
-            conn.execute("""INSERT INTO targets(region,name,host,port,enabled) VALUES(?,?,?,?,1)
-              ON CONFLICT(region) DO UPDATE SET name=excluded.name,host=excluded.host,port=excluded.port""",
+            conn.execute("""INSERT INTO targets(region,name,host,port,enabled,custom) VALUES(?,?,?,?,1,0)
+              ON CONFLICT(region) DO UPDATE SET name=excluded.name,host=excluded.host,port=excluded.port,custom=0""",
               (region, item["name"], host, int(item.get("port", 443))))
+
+
+def validate_endpoint(host, port):
+    host = str(host or "").strip().strip("[]")
+    if not host or len(host) > 253 or any(c.isspace() for c in host) or any(c in host for c in "/?#@"):
+        raise ValueError("服务器地址格式无效，请填写域名、IPv4 或 IPv6，不要包含 http:// 或路径")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            ascii_host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ValueError("服务器域名格式无效")
+        if not re.fullmatch(r"(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", ascii_host):
+            raise ValueError("服务器域名格式无效")
+        host = ascii_host.lower()
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        raise ValueError("端口必须是 1 至 65535 的整数")
+    if not 1 <= port <= 65535:
+        raise ValueError("端口必须是 1 至 65535 的整数")
+    return host, port
+
+
+def parse_endpoint(value):
+    value = str(value or "").strip()
+    bracketed = re.fullmatch(r"\[([^]]+)\](?::(\d+))?", value)
+    if bracketed:
+        return validate_endpoint(bracketed.group(1), bracketed.group(2) or 443)
+    if value.count(":") == 1:
+        host, candidate = value.rsplit(":", 1)
+        if candidate.isdigit():
+            return validate_endpoint(host, candidate)
+    return validate_endpoint(value, 443)
+
+
+def list_targets():
+    with db() as conn:
+        rows = [dict(row) for row in conn.execute(
+            "SELECT region,name,host,port,enabled,custom FROM targets ORDER BY custom,name,region")]
+    for row in rows:
+        row["enabled"] = bool(row["enabled"])
+        row["custom"] = bool(row["custom"])
+    return {"targets": rows, "custom_limit": 100}
+
+
+def add_custom_target(conn, name, host, port):
+    host, port = validate_endpoint(host, port)
+    name = str(name or "").strip() or host
+    if len(name) > 80:
+        raise ValueError("节点名称不能超过 80 个字符")
+    if conn.execute("SELECT 1 FROM targets WHERE custom=1 AND lower(host)=lower(?) AND port=?", (host, port)).fetchone():
+        raise ValueError(f"自定义节点已存在：{host}:{port}")
+    if conn.execute("SELECT COUNT(*) FROM targets WHERE custom=1").fetchone()[0] >= 100:
+        raise ValueError("自定义节点最多 100 个")
+    region = "custom-" + uuid.uuid4().hex[:12]
+    conn.execute("INSERT INTO targets(region,name,host,port,enabled,custom) VALUES(?,?,?,?,1,1)",
+                 (region, name, host, port))
+    return region
+
+
+def manage_targets(payload):
+    action = payload.get("action")
+    with round_lock:
+        with db() as conn:
+            if action == "add":
+                region = add_custom_target(conn, payload.get("name"), payload.get("host"), payload.get("port", 443))
+                result = {"added": 1, "region": region}
+            elif action == "bulk_add":
+                lines = payload.get("lines")
+                if not isinstance(lines, list) or not 1 <= len(lines) <= 50:
+                    raise ValueError("每次批量导入 1 至 50 行")
+                parsed = []
+                for raw in lines:
+                    text = str(raw or "").strip()
+                    if not text:
+                        continue
+                    parts = re.split(r"[\t,，]", text, maxsplit=1)
+                    name, endpoint = (parts[0].strip(), parts[1].strip()) if len(parts) == 2 else (text, text)
+                    host, port = parse_endpoint(endpoint)
+                    parsed.append((name, host, port))
+                if not parsed:
+                    raise ValueError("没有可导入的节点")
+                if conn.execute("SELECT COUNT(*) FROM targets WHERE custom=1").fetchone()[0] + len(parsed) > 100:
+                    raise ValueError("导入后自定义节点将超过 100 个")
+                for name, host, port in parsed:
+                    add_custom_target(conn, name, host, port)
+                result = {"added": len(parsed)}
+            elif action == "update":
+                region = str(payload.get("region") or "")
+                current = conn.execute("SELECT * FROM targets WHERE region=?", (region,)).fetchone()
+                if not current or not current["custom"]:
+                    raise ValueError("只能编辑自定义节点")
+                host, port = validate_endpoint(payload.get("host"), payload.get("port"))
+                name = str(payload.get("name") or "").strip() or host
+                if len(name) > 80:
+                    raise ValueError("节点名称不能超过 80 个字符")
+                duplicate = conn.execute("SELECT 1 FROM targets WHERE custom=1 AND region<>? AND lower(host)=lower(?) AND port=?",
+                                         (region, host, port)).fetchone()
+                if duplicate:
+                    raise ValueError(f"自定义节点已存在：{host}:{port}")
+                conn.execute("UPDATE targets SET name=?,host=?,port=? WHERE region=?", (name, host, port, region))
+                result = {"updated": region}
+            elif action == "toggle":
+                region = str(payload.get("region") or "")
+                enabled = 1 if payload.get("enabled") else 0
+                if not conn.execute("SELECT 1 FROM targets WHERE region=?", (region,)).fetchone():
+                    raise ValueError("节点不存在")
+                conn.execute("UPDATE targets SET enabled=? WHERE region=?", (enabled, region))
+                result = {"updated": region, "enabled": bool(enabled)}
+            elif action == "delete":
+                region = str(payload.get("region") or "")
+                current = conn.execute("SELECT custom FROM targets WHERE region=?", (region,)).fetchone()
+                if not current or not current["custom"]:
+                    raise ValueError("甲骨文默认节点不能删除，只能停用")
+                conn.execute("DELETE FROM results WHERE region=?", (region,))
+                conn.execute("DELETE FROM targets WHERE region=?", (region,))
+                result = {"deleted": region}
+            else:
+                raise ValueError("不支持的节点操作")
+    wake_event.set()
+    result.update(list_targets())
+    return result
 
 
 async def probe(target):
@@ -357,6 +487,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_data(summary(q.get("hours", [24])[0]))
             elif url.path == "/api/history":
                 self.send_data(history(q.get("region", [""])[0], q.get("hours", [24])[0]))
+            elif url.path == "/api/targets":
+                self.send_data(list_targets())
             elif url.path == "/api/export.csv":
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 self.send_data(csv_bytes(q.get("hours", [48])[0]), "text/csv; charset=utf-8",
@@ -369,13 +501,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urlparse(self.path)
         try:
-            if url.path not in ("/api/control", "/api/settings"):
+            if url.path not in ("/api/control", "/api/settings", "/api/targets"):
                 self.send_data({"error":"not found"}, status=404)
                 return
             length = min(4096, int(self.headers.get("Content-Length", "0")))
             payload = json.loads(self.rfile.read(length) or b"{}")
             if url.path == "/api/settings":
                 self.send_data(update_settings(payload))
+            elif url.path == "/api/targets":
+                self.send_data(manage_targets(payload))
             else:
                 self.send_data(control(payload.get("action")))
         except (ValueError, json.JSONDecodeError) as exc:
