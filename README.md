@@ -1,5 +1,13 @@
 # Oracle TCP Monitor
 
+## 这是什么
+
+Oracle 的中文名称是**甲骨文**。本程序是一款用于测试**当前所在地网络到甲骨文云（Oracle Cloud Infrastructure，简称 OCI）各区域服务器连接速度**的工具。
+
+程序会并行连接甲骨文云各区域的 Object Storage HTTPS 服务端口（TCP 443），记录 TCP 建连延迟、平均延迟、P95、抖动和成功率，帮助你比较当地宽带或运营商连接不同甲骨文云区域时的线路质量，并选择更合适的区域。
+
+> 测得的是当前电脑到甲骨文云区域服务入口的 TCP 建连速度，适合做区域间的线路对比，但不等同于某台具体云服务器的完整业务速度或下载带宽。
+
 一个轻量、零第三方运行时依赖的 Oracle Cloud 全球区域 TCP 443 延迟监控工具。
 
 它会并行连接 OCI 官方区域表中的 45 个 Object Storage 端点，将结果持续写入本机 SQLite，并通过浏览器展示实时排名、平均延迟、P95、抖动、成功率和历史趋势。
@@ -78,6 +86,38 @@ python -m PyInstaller --noconfirm --clean --onefile `
 数据库和导出的 CSV 可能反映你的网络环境和解析 IP。提交 Issue 时请先检查并删除不希望公开的数据。
 
 ## 区域来源
+
+### 默认测试节点（45 个）
+
+| 国家或地区 | 节点（OCI Region） |
+| --- | --- |
+| 澳大利亚 | 悉尼 `ap-sydney-1`、墨尔本 `ap-melbourne-1` |
+| 巴西 | 圣保罗 `sa-saopaulo-1`、维涅杜 `sa-vinhedo-1` |
+| 加拿大 | 蒙特利尔 `ca-montreal-1`、多伦多 `ca-toronto-1` |
+| 智利 | 圣地亚哥 `sa-santiago-1`、瓦尔帕莱索 `sa-valparaiso-1` |
+| 哥伦比亚 | 波哥大 `sa-bogota-1` |
+| 法国 | 巴黎 `eu-paris-1`、马赛 `eu-marseille-1` |
+| 德国 | 法兰克福 `eu-frankfurt-1` |
+| 印度 | 海得拉巴 `ap-hyderabad-1`、孟买 `ap-mumbai-1` |
+| 印度尼西亚 | 巴淡 `ap-batam-1` |
+| 以色列 | 耶路撒冷 `il-jerusalem-1` |
+| 意大利 | 米兰 `eu-milan-1`、都灵 `eu-turin-1` |
+| 日本 | 大阪 `ap-osaka-1`、东京 `ap-tokyo-1` |
+| 马来西亚 | 居銮 `ap-kulai-2` |
+| 墨西哥 | 克雷塔罗 `mx-queretaro-1`、蒙特雷 `mx-monterrey-1` |
+| 摩洛哥 | 卡萨布兰卡 `af-casablanca-1` |
+| 荷兰 | 阿姆斯特丹 `eu-amsterdam-1` |
+| 沙特阿拉伯 | 利雅得 `me-riyadh-1`、吉达 `me-jeddah-1` |
+| 塞尔维亚 | 约万诺瓦茨 `eu-jovanovac-1` |
+| 新加坡 | 新加坡 `ap-singapore-1`、新加坡西部 `ap-singapore-2` |
+| 南非 | 约翰内斯堡 `af-johannesburg-1` |
+| 韩国 | 首尔 `ap-seoul-1`、春川 `ap-chuncheon-1` |
+| 西班牙 | 马德里 `eu-madrid-1`、马德里 3 `eu-madrid-3` |
+| 瑞典 | 斯德哥尔摩 `eu-stockholm-1` |
+| 瑞士 | 苏黎世 `eu-zurich-1` |
+| 阿联酋 | 阿布扎比 `me-abudhabi-1`、迪拜 `me-dubai-1` |
+| 英国 | 伦敦 `uk-london-1`、纽波特 `uk-cardiff-1` |
+| 美国 | 阿什本 `us-ashburn-1`、芝加哥 `us-chicago-1`、凤凰城 `us-phoenix-1`、圣何塞 `us-sanjose-1` |
 
 - [Oracle Cloud Infrastructure Regions and Availability Domains](https://docs.oracle.com/en-us/iaas/Content/General/Concepts/regions.htm)
 - 塞尔维亚 `eu-jovanovac-1` 属于 OC20，使用 `oraclecloud20.com` realm domain
