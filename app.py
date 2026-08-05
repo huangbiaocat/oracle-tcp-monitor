@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import csv
 import http.client
 import io
@@ -7,6 +8,7 @@ import json
 import math
 import os
 import re
+import shutil
 import socket
 import ssl
 import sqlite3
@@ -17,14 +19,25 @@ import threading
 import time
 import uuid
 import webbrowser
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+try:
+    import webview
+    WEBVIEW_AVAILABLE = True
+except Exception:
+    webview = None
+    WEBVIEW_AVAILABLE = False
+
 FROZEN = getattr(sys, "frozen", False)
 ROOT = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 ASSET_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
+APP_VERSION = "1.5.0"
+REPO_API = "https://api.github.com/repos/huangbiaocat/oracle-tcp-monitor/releases/latest"
+UPDATE_CACHE = {"checked_at": 0.0, "data": None}
 DB_PATH = ROOT / "oracle_latency.db"
 SETTINGS_PATH = ROOT / "oracle_tcp_settings.json"
 TARGETS_PATH = ASSET_ROOT / "targets.json"
@@ -519,6 +532,179 @@ def update_settings(payload):
         return dict(state)
 
 
+def version_tuple(text):
+    parts = re.findall(r"\d+", str(text or ""))
+    return tuple(int(x) for x in parts[:3]) or (0,)
+
+
+def check_update(force=False):
+    now = time.time()
+    if not force and now - UPDATE_CACHE["checked_at"] < 1800 and UPDATE_CACHE["data"]:
+        return UPDATE_CACHE["data"]
+    result = {"current_version": APP_VERSION, "frozen": bool(FROZEN), "checked_at": utc_now(),
+              "updatable": False, "error": None}
+    if not FROZEN:
+        result["error"] = "当前是源码运行模式，不支持自动更新；请使用 Releases 的单文件 EXE 版本"
+        UPDATE_CACHE.update(checked_at=now, data=result)
+        return result
+    try:
+        request = urllib.request.Request(REPO_API, headers={
+            "User-Agent": f"OracleTCPMonitor/{APP_VERSION}",
+            "Accept": "application/vnd.github+json",
+        })
+        with urllib.request.urlopen(request, timeout=8) as response:
+            data = json.loads(response.read(131072).decode("utf-8"))
+        tag = str(data.get("tag_name") or "").strip()
+        latest = tag.lstrip("vV")
+        asset = next((a for a in data.get("assets", []) if str(a.get("name", "")).lower().endswith(".exe")), None)
+        result.update({
+            "latest_version": latest,
+            "latest_tag": tag,
+            "release_url": data.get("html_url") or "https://github.com/huangbiaocat/oracle-tcp-monitor/releases/latest",
+            "asset_name": asset.get("name") if asset else None,
+            "asset_url": asset.get("browser_download_url") if asset else None,
+            "asset_size": asset.get("size") if asset else None,
+        })
+        if not asset:
+            result["error"] = "最新版本没有找到可下载的 EXE 文件"
+        elif version_tuple(latest) <= version_tuple(APP_VERSION):
+            result["error"] = f"已是最新版本 v{APP_VERSION}"
+        else:
+            result["updatable"] = True
+    except Exception as exc:
+        result["error"] = f"检查更新失败：{type(exc).__name__}: {exc}"
+    UPDATE_CACHE.update(checked_at=now, data=result)
+    return result
+
+
+def spawn_updater(new_file, target):
+    log_file = new_file.with_name(new_file.name + ".log")
+    script_file = new_file.with_name(new_file.name + ".ps1")
+    if log_file.exists():
+        try:
+            log_file.unlink()
+        except OSError:
+            pass
+    q = lambda s: str(s).replace(chr(39), chr(39) + chr(39))
+    env_lines = "".join(
+        f"$env:{k}='{q(v)}';"
+        for k, v in os.environ.items()
+        if k.startswith("TCP_")
+    )
+    inner = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        f"$log='{q(log_file)}';"
+        f"$self={os.getpid()};"
+        f"$new='{q(new_file)}';"
+        f"$old='{q(target)}';"
+        "Out-File -FilePath $log -InputObject 'start' -Encoding utf8;"
+        "Wait-Process -Id $self;"
+        "Out-File -FilePath $log -Append -InputObject 'app-exited' -Encoding utf8;"
+        "Start-Sleep -Milliseconds 800;"
+        "Out-File -FilePath $log -Append -InputObject 'moving' -Encoding utf8;"
+        "$n=0;"
+        "while($n -lt 15){ try { Move-Item -LiteralPath $new -Destination $old -Force; break } "
+        "catch { Start-Sleep -Milliseconds 500; $n++ } };"
+        "Out-File -FilePath $log -Append -InputObject ('moved n=' + $n) -Encoding utf8;"
+        "if(Test-Path -LiteralPath $old){ Out-File -FilePath $log -Append -InputObject 'starting' -Encoding utf8; "
+        + env_lines +
+        "Out-File -FilePath $log -Append -InputObject ('port=' + $env:TCP_PORT) -Encoding utf8; "
+        "$p = Start-Process -FilePath $old -PassThru; "
+        "Out-File -FilePath $log -Append -InputObject ('started pid=' + $p.Id) -Encoding utf8 };"
+        "schtasks /Delete /TN OracleTCPMonitorUpdater /F | Out-Null;"
+        f"Remove-Item -LiteralPath '{q(script_file)}' -Force"
+    )
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    inner_encoded = base64.b64encode(inner.encode("utf-16-le")).decode("ascii")
+
+    def updater_started():
+        for _ in range(12):
+            if log_file.exists():
+                return True
+            time.sleep(0.25)
+        return False
+
+    # 主方案：通过 WMI 创建更新进程，脱离本程序进程树，新 EXE 可正常启动。
+    outer = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "Remove-Item Env:_MEIPASS -ErrorAction SilentlyContinue;"
+        "Remove-Item Env:_MEIPASS2 -ErrorAction SilentlyContinue;"
+        f"$cmd='powershell.exe -NoProfile -WindowStyle Hidden -EncodedCommand {inner_encoded}';"
+        "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd } | Out-Null"
+    )
+    outer_encoded = base64.b64encode(outer.encode("utf-16-le")).decode("ascii")
+    clean_env = {k: v for k, v in os.environ.items() if k not in ("_MEIPASS", "_MEIPASS2")}
+    subprocess.Popen(
+        ["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-EncodedCommand", outer_encoded],
+        env=clean_env,
+        creationflags=flags,
+    )
+    if updater_started():
+        return
+    # 备用：任务计划程序。注意 schtasks /TR 有 261 字符限制，因此引用 .ps1 文件。
+    try:
+        script_file.write_text(inner, encoding="utf-8-sig")
+        task_name = "OracleTCPMonitorUpdater"
+        task_command = f'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{script_file}"'
+        created = subprocess.run(
+            ["schtasks.exe", "/Create", "/TN", task_name, "/TR", task_command,
+             "/SC", "ONCE", "/ST", "23:59", "/F"],
+            creationflags=flags, capture_output=True, timeout=15,
+        )
+        launched = subprocess.run(
+            ["schtasks.exe", "/Run", "/TN", task_name],
+            creationflags=flags, capture_output=True, timeout=15,
+        )
+        if created.returncode == 0 and launched.returncode == 0 and updater_started():
+            return
+    except Exception:
+        pass
+
+
+def apply_update():
+    info = check_update(force=True)
+    if not info.get("updatable"):
+        return info
+    target = Path(sys.executable).resolve()
+    new_file = target.with_name(target.name + ".update")
+    tmp_file = new_file.with_suffix(".download")
+    info.update({"downloaded": False, "error": None})
+    try:
+        request = urllib.request.Request(info["asset_url"], headers={"User-Agent": f"OracleTCPMonitor/{APP_VERSION}"})
+        with urllib.request.urlopen(request, timeout=120) as response:
+            with open(tmp_file, "wb") as output:
+                shutil.copyfileobj(response, output, length=1024 * 256)
+        size = tmp_file.stat().st_size
+        expected = info.get("asset_size")
+        if expected and abs(size - int(expected)) > 64:
+            raise ValueError(f"下载文件大小校验失败（{size} 字节，预期 {expected} 字节）")
+        os.replace(tmp_file, new_file)
+        info.update({
+            "downloaded": True,
+            "update_file": str(new_file),
+            "app_exit_hint": "新版本已下载完成，程序即将退出并自动替换，替换完成后会自动重新打开。",
+        })
+        spawn_updater(new_file, target)
+    except Exception as exc:
+        if tmp_file.exists():
+            tmp_file.unlink()
+        info.update({"updatable": False, "error": f"更新失败：{type(exc).__name__}: {exc}"})
+    return info
+
+
+def cleanup_update_files():
+    if not FROZEN:
+        return
+    target = Path(sys.executable).resolve()
+    for suffix in (".update", ".download"):
+        path = target.with_name(target.name + suffix)
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 REGION_ZH = {"Beijing":"北京市","Tianjin":"天津市","Hebei":"河北省","Shanxi":"山西省","Inner Mongolia":"内蒙古自治区","Liaoning":"辽宁省","Jilin":"吉林省","Heilongjiang":"黑龙江省","Shanghai":"上海市","Jiangsu":"江苏省","Zhejiang":"浙江省","Anhui":"安徽省","Fujian":"福建省","Jiangxi":"江西省","Shandong":"山东省","Henan":"河南省","Hubei":"湖北省","Hunan":"湖南省","Guangdong":"广东省","Guangxi":"广西壮族自治区","Hainan":"海南省","Chongqing":"重庆市","Sichuan":"四川省","Guizhou":"贵州省","Yunnan":"云南省","Tibet":"西藏自治区","Shaanxi":"陕西省","Gansu":"甘肃省","Qinghai":"青海省","Ningxia":"宁夏回族自治区","Xinjiang":"新疆维吾尔自治区","Hong Kong":"香港特别行政区","Macao":"澳门特别行政区","Taiwan":"台湾省"}
 CITY_ZH = {"Dongguan":"东莞市","Guangzhou":"广州市","Shenzhen":"深圳市","Nanning":"南宁市","Guilin":"桂林市","Liuzhou":"柳州市","Chongzuo":"崇左市","Qinzhou":"钦州市","Beihai":"北海市","Fangchenggang":"防城港市","Guigang":"贵港市","Yulin":"玉林市","Baise":"百色市","Hezhou":"贺州市","Hechi":"河池市","Laibin":"来宾市","Wuzhou":"梧州市","Beijing":"北京市","Shanghai":"上海市","Chengdu":"成都市","Chongqing":"重庆市","Wuhan":"武汉市","Changsha":"长沙市","Hangzhou":"杭州市","Nanjing":"南京市","Fuzhou":"福州市","Xiamen":"厦门市"}
 
@@ -888,6 +1074,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_data(list_projects(refresh=want_refresh))
             elif url.path == "/api/compare":
                 self.send_data(compare_metrics(q.get("start", [""])[0], q.get("end", [""])[0], q.get("metric", ["avg"])[0]))
+            elif url.path == "/api/update/check":
+                self.send_data(check_update(force=want_refresh))
             elif url.path == "/api/export_compare.csv":
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 self.send_data(compare_csv(q.get("start", [""])[0], q.get("end", [""])[0], q.get("metric", ["avg"])[0]),
@@ -905,13 +1093,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urlparse(self.path)
         try:
-            if url.path not in ("/api/control", "/api/settings", "/api/targets", "/api/projects"):
+            if url.path not in ("/api/control", "/api/settings", "/api/targets", "/api/projects", "/api/update/apply"):
                 self.send_data({"error":"not found"}, status=404)
                 return
             length = min(4096, int(self.headers.get("Content-Length", "0")))
             payload = json.loads(self.rfile.read(length) or b"{}")
             if url.path == "/api/settings":
                 self.send_data(update_settings(payload))
+            elif url.path == "/api/update/apply":
+                self.send_data(apply_update())
             elif url.path == "/api/targets":
                 self.send_data(manage_targets(payload))
             elif url.path == "/api/projects":
@@ -924,17 +1114,83 @@ class Handler(BaseHTTPRequestHandler):
             self.send_data({"error": f"{type(exc).__name__}: {exc}"}, status=500)
 
 
+def start_ui(server, url):
+    """启动桌面界面：优先原生窗口，其次浏览器，最后无界面。返回 True 表示原生窗口已接管主线程。"""
+    ui_mode = os.environ.get("TCP_UI", "auto").strip().lower()
+    if os.environ.get("TCP_OPEN_BROWSER", "1") == "0" or ui_mode == "none":
+        return False
+    if ui_mode == "browser":
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+        return False
+    if WEBVIEW_AVAILABLE:
+        try:
+            class UiApi:
+                def open_browser(self):
+                    webbrowser.open(url)
+                    return True
+
+                def close_window(self):
+                    for window in list(webview.windows):
+                        try:
+                            window.destroy()
+                        except Exception:
+                            pass
+                    return True
+
+            webview.create_window(
+                "Oracle TCP 延迟监控", url,
+                width=1320, height=880, min_size=(980, 620),
+                js_api=UiApi(), background_color="#08111f",
+            )
+            webview.start()
+            return True
+        except Exception as exc:
+            print(f"原生窗口启动失败（{type(exc).__name__}: {exc}），改用浏览器打开。")
+    threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    return False
+
+
+def schedule_auto_exit(server, seconds):
+    """测试/自动化用：到达指定秒数后自动退出（0 表示不启用）。"""
+    if seconds <= 0:
+        return
+
+    def _exit():
+        time.sleep(seconds)
+        stop_event.set()
+        try:
+            if WEBVIEW_AVAILABLE and webview.windows:
+                for window in list(webview.windows):
+                    window.destroy()
+        except Exception:
+            pass
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+
+    threading.Thread(target=_exit, daemon=True).start()
+
+
 def main():
+    cleanup_update_files()
     init_db()
     worker = threading.Thread(target=monitor_loop, name="tcp-monitor", daemon=True)
     worker.start()
     server = ThreadingHTTPServer((HOST, WEB_PORT), Handler)
-    print(f"Oracle TCP 延迟监控已启动：http://{HOST}:{WEB_PORT}")
+    url = f"http://{HOST}:{WEB_PORT}"
+    print(f"Oracle TCP 延迟监控已启动：{url}")
     print(f"检测间隔 {state['interval']} 秒，TCP 超时 {state['timeout']} 秒，计划时长 {state['duration_hours']:g} 小时")
-    if os.environ.get("TCP_OPEN_BROWSER", "1") != "0":
-        threading.Timer(1.0, lambda: webbrowser.open(f"http://{HOST}:{WEB_PORT}")).start()
+    server_thread = threading.Thread(target=server.serve_forever, name="http-server", daemon=True)
+    server_thread.start()
+    schedule_auto_exit(server, float(os.environ.get("TCP_EXIT_AFTER_SECONDS", "0") or 0))
     try:
-        server.serve_forever()
+        if start_ui(server, url):
+            stop_event.set()
+            server.shutdown()
+        else:
+            while not stop_event.is_set():
+                time.sleep(0.5)
     except KeyboardInterrupt:
         pass
     finally:
