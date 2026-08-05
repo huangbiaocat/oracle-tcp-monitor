@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -165,7 +165,7 @@ def list_targets():
     return {"targets": rows, "custom_limit": 100}
 
 
-def list_projects():
+def list_projects(refresh=False):
     with db() as conn:
         projects = [dict(row) for row in conn.execute("SELECT id,name,network_label,created_at,detected_isp,detected_region,detected_city,last_public_ipv4,local_ssid FROM projects ORDER BY id")]
         result_times = conn.execute("SELECT project_id,tested_at FROM results ORDER BY project_id,tested_at").fetchall()
@@ -188,7 +188,8 @@ def list_projects():
         project["records"] = sum(item["records"] for item in sessions)
         project["sessions"] = sessions[-100:]
         project["collecting"] = bool(collecting and project["id"] == current)
-    current_net = get_public_network().get("ipv4") or get_public_network().get("ipv6") or {}
+    current_network = get_public_network(force=refresh)
+    current_net = current_network.get("ipv4") or current_network.get("ipv6") or {}
     current_ssid = get_local_network_identity().get("ssid")
     carrier = next((x for x in ("联通", "移动", "电信", "教育网") if x in current_net.get("isp", "")), "")
     region_key = current_net.get("region", "").replace("壮族自治区", "").replace("自治区", "").replace("省", "").replace("市", "")
@@ -225,7 +226,7 @@ def manage_projects(payload):
         with state_lock:
             state["project_id"], state["network_label"] = project_id, label
         save_current_settings()
-    elif action in ("switch", "start"):
+    elif action in ("switch", "view", "start"):
         try:
             project_id = int(payload.get("project_id"))
         except (TypeError, ValueError):
@@ -236,18 +237,22 @@ def manage_projects(payload):
             raise ValueError("测试项目不存在")
         with state_lock:
             state["project_id"], state["network_label"] = project["id"], project["network_label"]
+            if action == "view":
+                state["awaiting_project"] = False
+                state["paused"] = True
             if action == "start":
                 state["awaiting_project"] = False
                 state["paused"] = False
                 state["running"] = True
                 state["started_at"] = time.time()
         if action == "start":
-            detected = get_public_network().get("ipv4") or get_public_network().get("ipv6") or {}
+            current_network = get_public_network(force=True)
+            detected = current_network.get("ipv4") or current_network.get("ipv6") or {}
             local_ssid = get_local_network_identity().get("ssid")
             with db() as conn:
                 conn.execute("UPDATE projects SET detected_isp=?,detected_region=?,detected_city=?,last_public_ipv4=?,local_ssid=COALESCE(local_ssid,?) WHERE id=?",
                              (detected.get("isp"), detected.get("region"), detected.get("city"),
-                              (get_public_network().get("ipv4") or {}).get("ip"), local_ssid, project_id))
+                              (current_network.get("ipv4") or {}).get("ip"), local_ssid, project_id))
         save_current_settings()
     elif action == "update":
         try:
@@ -564,10 +569,11 @@ def chinese_network(data, version):
     return {"ip":public_ip,"isp":isp,"isp_raw":isp_raw,"asn":connection.get("asn") or data.get("asn"),"city":city,"region":region,"country":country,"display":" · ".join(parts)}
 
 
-def get_public_network():
+def get_public_network(force=False):
     with public_ip_lock:
         now = time.time()
-        if now - public_ip_cache["checked_at"] < 300:
+        local_key = local_identity_key()
+        if not force and now - public_ip_cache["checked_at"] < 300 and public_ip_cache.get("local_key") == local_key:
             return public_ip_cache["value"]
         value = {"ipv4": None, "ipv6": None}
         for key, family, version in (("ipv4", socket.AF_INET, 4), ("ipv6", socket.AF_INET6, 6)):
@@ -581,7 +587,7 @@ def get_public_network():
                 except (OSError, ValueError, TypeError):
                     continue
         value["display"] = "\n".join(value[key]["display"] for key in ("ipv4", "ipv6") if value[key])
-        public_ip_cache.update(value=value, checked_at=now)
+        public_ip_cache.update(value=value, checked_at=now, local_key=local_key)
         return value
 
 
@@ -603,7 +609,21 @@ def get_local_network_identity():
     return value
 
 
-def network_info():
+def local_identity_key():
+    ssid = get_local_network_identity().get("ssid")
+    ip = None
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+    except OSError:
+        pass
+    finally:
+        sock.close()
+    return (ssid, ip)
+
+
+def network_info(force=False):
     hostname = socket.gethostname()
     ips = set()
     try:
@@ -621,7 +641,7 @@ def network_info():
     finally:
         sock.close()
     proxy_vars = [k for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy") if os.environ.get(k)]
-    public_network = dict(get_public_network())
+    public_network = dict(get_public_network(force=force))
     with state_lock:
         network_label = state.get("network_label", "")
     public_network["custom_label"] = network_label
@@ -696,6 +716,98 @@ def history(region, hours):
     return {"region": region, "hours": hours, "points": [dict(x) for x in rows[::step]]}
 
 
+def parse_compare_range(start, end):
+    try:
+        start_dt = datetime.fromisoformat(str(start or "").replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(str(end or "").replace("Z", "+00:00"))
+    except ValueError:
+        start_dt = end_dt = None
+    if start_dt is None or end_dt is None or end_dt <= start_dt:
+        end_dt = datetime.now(timezone.utc)
+        start_dt = end_dt - timedelta(hours=24)
+    return start_dt.isoformat(timespec="milliseconds"), end_dt.isoformat(timespec="milliseconds")
+
+
+def compare_metrics(start=None, end=None, metric="avg"):
+    start_iso, end_iso = parse_compare_range(start, end)
+    if metric not in ("avg", "p95", "success_rate"):
+        metric = "avg"
+    with db() as conn:
+        projects = [dict(row) for row in conn.execute(
+            "SELECT id,name,network_label,detected_isp,detected_region,detected_city,last_public_ipv4,local_ssid "
+            "FROM projects ORDER BY id")]
+        regions = [dict(row) for row in conn.execute("SELECT region,name,custom FROM targets ORDER BY custom,name,region")]
+        rows = conn.execute(
+            "SELECT project_id,region,latency_ms,success FROM results "
+            "WHERE tested_at>=? AND tested_at<? ORDER BY project_id,region,tested_at",
+            (start_iso, end_iso)).fetchall()
+    buckets = {}
+    project_success = {p["id"]: [] for p in projects}
+    project_samples = {p["id"]: 0 for p in projects}
+    for row in rows:
+        key = (row["project_id"], row["region"])
+        buckets.setdefault(key, []).append(row)
+        project_samples[row["project_id"]] += 1
+        if row["success"] and row["latency_ms"] is not None:
+            project_success[row["project_id"]].append(row["latency_ms"])
+    project_out = []
+    for p in projects:
+        oks = project_success[p["id"]]
+        project_out.append({
+            **p, "records": project_samples[p["id"]], "successes": len(oks),
+            "avg_ms": round(statistics.fmean(oks), 2) if oks else None,
+            "p95_ms": round(percentile(oks, .95), 2) if oks else None,
+            "success_rate": round(len(oks) / project_samples[p["id"]] * 100, 2) if project_samples[p["id"]] else None,
+        })
+    region_out = []
+    for r in regions:
+        values = {}
+        for p in projects:
+            items = buckets.get((p["id"], r["region"]), [])
+            oks = [x["latency_ms"] for x in items if x["success"] and x["latency_ms"] is not None]
+            values[str(p["id"])] = {
+                "avg_ms": round(statistics.fmean(oks), 2) if oks else None,
+                "p95_ms": round(percentile(oks, .95), 2) if oks else None,
+                "min_ms": round(min(oks), 2) if oks else None,
+                "max_ms": round(max(oks), 2) if oks else None,
+                "jitter_ms": round(statistics.pstdev(oks), 2) if len(oks) > 1 else (0 if oks else None),
+                "success_rate": round(len(oks) / len(items) * 100, 2) if items else None,
+                "samples": len(items), "successes": len(oks),
+            }
+        region_out.append({**r, "values": values})
+
+    def sort_score(r):
+        avgs = [v["avg_ms"] for v in r["values"].values() if v["avg_ms"] is not None]
+        return (not avgs, min(avgs) if avgs else 10**9)
+    region_out.sort(key=sort_score)
+    return {"start": start_iso, "end": end_iso, "metric": metric,
+            "projects": project_out, "regions": region_out}
+
+
+def compare_csv(start=None, end=None, metric="avg"):
+    data = compare_metrics(start, end, metric)
+    metric_names = {"avg": "平均延迟", "p95": "P95 延迟", "success_rate": "成功率"}
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    writer.writerow(["Oracle TCP Monitor 网络环境横向对比"])
+    writer.writerow(["开始时间(UTC)", data["start"]])
+    writer.writerow(["结束时间(UTC)", data["end"]])
+    writer.writerow(["对比指标", metric_names.get(data["metric"], data["metric"])])
+    writer.writerow([])
+    writer.writerow(["区域标识", "地区名称"] + [f"{p['name']}（{p['network_label'] or '无标注'}）" for p in data["projects"]])
+    for region in data["regions"]:
+        row = [region["region"], region["name"]]
+        for p in data["projects"]:
+            value = region["values"].get(str(p["id"])) or {}
+            if data["metric"] == "success_rate":
+                row.append(f"{value['success_rate']}%" if value.get("success_rate") is not None else "")
+            else:
+                key = data["metric"] + "_ms"
+                row.append(f"{value[key]} ms" if value.get(key) is not None else "")
+        writer.writerow(row)
+    return ("\ufeff" + out.getvalue()).encode("utf-8")
+
+
 def csv_bytes(hours):
     selected_hours, since = window_clause(hours)
     with state_lock:
@@ -757,13 +869,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urlparse(self.path)
         q = parse_qs(url.query)
+        want_refresh = q.get("refresh", ["0"])[0].lower() in ("1", "true", "yes", "on")
         try:
             if url.path == "/":
                 self.send_data(WEB_PATH.read_bytes(), "text/html; charset=utf-8")
             elif url.path == "/api/status":
                 with state_lock: payload = dict(state)
                 payload["db_size_bytes"] = DB_PATH.stat().st_size if DB_PATH.exists() else 0
-                payload["network"] = network_info()
+                payload["network"] = network_info(force=want_refresh)
                 self.send_data(payload)
             elif url.path == "/api/summary":
                 self.send_data(summary(q.get("hours", [24])[0]))
@@ -772,7 +885,14 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == "/api/targets":
                 self.send_data(list_targets())
             elif url.path == "/api/projects":
-                self.send_data(list_projects())
+                self.send_data(list_projects(refresh=want_refresh))
+            elif url.path == "/api/compare":
+                self.send_data(compare_metrics(q.get("start", [""])[0], q.get("end", [""])[0], q.get("metric", ["avg"])[0]))
+            elif url.path == "/api/export_compare.csv":
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                self.send_data(compare_csv(q.get("start", [""])[0], q.get("end", [""])[0], q.get("metric", ["avg"])[0]),
+                  "text/csv; charset=utf-8",
+                  headers={"Content-Disposition": f'attachment; filename="oracle_tcp_compare_{stamp}.csv"'})
             elif url.path == "/api/export.csv":
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 self.send_data(csv_bytes(q.get("hours", [48])[0]), "text/csv; charset=utf-8",
