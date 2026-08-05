@@ -99,7 +99,7 @@ def init_db():
         if "custom" not in columns:
             conn.execute("ALTER TABLE targets ADD COLUMN custom INTEGER NOT NULL DEFAULT 0")
         if conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0:
-            conn.execute("INSERT INTO projects(name,network_label,created_at) VALUES('????','',?)", (utc_now(),))
+            conn.execute("INSERT INTO projects(name,network_label,created_at) VALUES('默认项目','',?)", (utc_now(),))
         project_columns = {row["name"] for row in conn.execute("PRAGMA table_info(projects)")}
         for name in ("detected_isp", "detected_region", "detected_city", "last_public_ipv4"):
             if name not in project_columns:
@@ -120,23 +120,23 @@ def init_db():
 def validate_endpoint(host, port):
     host = str(host or "").strip().strip("[]")
     if not host or len(host) > 253 or any(c.isspace() for c in host) or any(c in host for c in "/?#@"):
-        raise ValueError("????????????????IPv4 ? IPv6????? http:// ???")
+        raise ValueError("服务器地址格式无效，请填写域名、IPv4 或 IPv6，不要包含 http:// 或路径")
     try:
         ipaddress.ip_address(host)
     except ValueError:
         try:
             ascii_host = host.encode("idna").decode("ascii")
         except UnicodeError:
-            raise ValueError("?????????")
+            raise ValueError("服务器域名格式无效")
         if not re.fullmatch(r"(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", ascii_host):
-            raise ValueError("?????????")
+            raise ValueError("服务器域名格式无效")
         host = ascii_host.lower()
     try:
         port = int(port)
     except (TypeError, ValueError):
-        raise ValueError("????? 1 ? 65535 ???")
+        raise ValueError("端口必须是 1 至 65535 的整数")
     if not 1 <= port <= 65535:
-        raise ValueError("????? 1 ? 65535 ???")
+        raise ValueError("端口必须是 1 至 65535 的整数")
     return host, port
 
 
@@ -186,9 +186,9 @@ def list_projects():
         project["sessions"] = sessions[-100:]
         project["collecting"] = bool(collecting and project["id"] == current)
     current_net = get_public_network().get("ipv4") or get_public_network().get("ipv6") or {}
-    carrier = next((x for x in ("??", "??", "??", "???") if x in current_net.get("isp", "")), "")
-    region_key = current_net.get("region", "").replace("?????", "").replace("???", "").replace("?", "").replace("?", "")
-    city_key = current_net.get("city", "").replace("?", "")
+    carrier = next((x for x in ("联通", "移动", "电信", "教育网") if x in current_net.get("isp", "")), "")
+    region_key = current_net.get("region", "").replace("壮族自治区", "").replace("自治区", "").replace("省", "").replace("市", "")
+    city_key = current_net.get("city", "").replace("市", "")
     best_score = 0
     for project in projects:
         text = project["name"] + " " + project.get("network_label", "")
@@ -217,13 +217,13 @@ def manage_projects(payload):
     if action == "add":
         name = str(payload.get("name") or "").strip()
         if not name or len(name) > 80:
-            raise ValueError("??????? 1 ? 80 ???")
+            raise ValueError("项目名称必须为 1 至 80 个字符")
         label = str(payload.get("network_label") or name).strip()[:80]
         with db() as conn:
             try:
                 cursor = conn.execute("INSERT INTO projects(name,network_label,created_at) VALUES(?,?,?)", (name, label, utc_now()))
             except sqlite3.IntegrityError:
-                raise ValueError("??????????")
+                raise ValueError("同名测试项目已经存在")
             project_id = cursor.lastrowid
         with state_lock:
             state["project_id"], state["network_label"] = project_id, label
@@ -232,11 +232,11 @@ def manage_projects(payload):
         try:
             project_id = int(payload.get("project_id"))
         except (TypeError, ValueError):
-            raise ValueError("??????")
+            raise ValueError("测试项目无效")
         with db() as conn:
             project = conn.execute("SELECT id,network_label FROM projects WHERE id=?", (project_id,)).fetchone()
         if not project:
-            raise ValueError("???????")
+            raise ValueError("测试项目不存在")
         with state_lock:
             state["project_id"], state["network_label"] = project["id"], project["network_label"]
             if action == "start":
@@ -255,18 +255,18 @@ def manage_projects(payload):
         try:
             project_id = int(payload.get("project_id"))
         except (TypeError, ValueError):
-            raise ValueError("??????")
+            raise ValueError("测试项目无效")
         name = str(payload.get("name") or "").strip()
         label = str(payload.get("network_label") or "").strip()[:80]
         if not name or len(name) > 80:
-            raise ValueError("??????? 1 ? 80 ???")
+            raise ValueError("项目名称必须为 1 至 80 个字符")
         with db() as conn:
             if not conn.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
-                raise ValueError("???????")
+                raise ValueError("测试项目不存在")
             try:
                 conn.execute("UPDATE projects SET name=?,network_label=? WHERE id=?", (name, label, project_id))
             except sqlite3.IntegrityError:
-                raise ValueError("??????????")
+                raise ValueError("同名测试项目已经存在")
         with state_lock:
             if state.get("project_id") == project_id:
                 state["network_label"] = label
@@ -275,13 +275,13 @@ def manage_projects(payload):
         try:
             project_id = int(payload.get("project_id"))
         except (TypeError, ValueError):
-            raise ValueError("??????")
+            raise ValueError("测试项目无效")
         with round_lock:
             with db() as conn:
                 if conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] <= 1:
-                    raise ValueError("????????????")
+                    raise ValueError("至少需要保留一个测试项目")
                 if not conn.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
-                    raise ValueError("???????")
+                    raise ValueError("测试项目不存在")
                 conn.execute("DELETE FROM results WHERE project_id=?", (project_id,))
                 conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
                 fallback = conn.execute("SELECT id,network_label FROM projects ORDER BY id LIMIT 1").fetchone()
@@ -290,7 +290,7 @@ def manage_projects(payload):
                 state["project_id"], state["network_label"] = fallback["id"], fallback["network_label"]
         save_current_settings()
     else:
-        raise ValueError("????????")
+        raise ValueError("不支持的项目操作")
     wake_event.set()
     return list_projects()
 
@@ -305,11 +305,11 @@ def add_custom_target(conn, name, host, port):
     host, port = validate_endpoint(host, port)
     name = str(name or "").strip() or host
     if len(name) > 80:
-        raise ValueError("???????? 80 ???")
+        raise ValueError("节点名称不能超过 80 个字符")
     if conn.execute("SELECT 1 FROM targets WHERE custom=1 AND lower(host)=lower(?) AND port=?", (host, port)).fetchone():
-        raise ValueError(f"?????????{host}:{port}")
+        raise ValueError(f"自定义节点已存在：{host}:{port}")
     if conn.execute("SELECT COUNT(*) FROM targets WHERE custom=1").fetchone()[0] >= 100:
-        raise ValueError("??????? 100 ?")
+        raise ValueError("自定义节点最多 100 个")
     region = "custom-" + uuid.uuid4().hex[:12]
     conn.execute("INSERT INTO targets(region,name,host,port,enabled,custom) VALUES(?,?,?,?,1,1)",
                  (region, name, host, port))
@@ -326,20 +326,20 @@ def manage_targets(payload):
             elif action == "bulk_add":
                 lines = payload.get("lines")
                 if not isinstance(lines, list) or not 1 <= len(lines) <= 50:
-                    raise ValueError("?????? 1 ? 50 ?")
+                    raise ValueError("每次批量导入 1 至 50 行")
                 parsed = []
                 for raw in lines:
                     text = str(raw or "").strip()
                     if not text:
                         continue
-                    parts = re.split(r"[\t,?]", text, maxsplit=1)
+                    parts = re.split(r"[\t,，]", text, maxsplit=1)
                     name, endpoint = (parts[0].strip(), parts[1].strip()) if len(parts) == 2 else (text, text)
                     host, port = parse_endpoint(endpoint)
                     parsed.append((name, host, port))
                 if not parsed:
-                    raise ValueError("????????")
+                    raise ValueError("没有可导入的节点")
                 if conn.execute("SELECT COUNT(*) FROM targets WHERE custom=1").fetchone()[0] + len(parsed) > 100:
-                    raise ValueError("??????????? 100 ?")
+                    raise ValueError("导入后自定义节点将超过 100 个")
                 for name, host, port in parsed:
                     add_custom_target(conn, name, host, port)
                 result = {"added": len(parsed)}
@@ -347,34 +347,34 @@ def manage_targets(payload):
                 region = str(payload.get("region") or "")
                 current = conn.execute("SELECT * FROM targets WHERE region=?", (region,)).fetchone()
                 if not current or not current["custom"]:
-                    raise ValueError("?????????")
+                    raise ValueError("只能编辑自定义节点")
                 host, port = validate_endpoint(payload.get("host"), payload.get("port"))
                 name = str(payload.get("name") or "").strip() or host
                 if len(name) > 80:
-                    raise ValueError("???????? 80 ???")
+                    raise ValueError("节点名称不能超过 80 个字符")
                 duplicate = conn.execute("SELECT 1 FROM targets WHERE custom=1 AND region<>? AND lower(host)=lower(?) AND port=?",
                                          (region, host, port)).fetchone()
                 if duplicate:
-                    raise ValueError(f"?????????{host}:{port}")
+                    raise ValueError(f"自定义节点已存在：{host}:{port}")
                 conn.execute("UPDATE targets SET name=?,host=?,port=? WHERE region=?", (name, host, port, region))
                 result = {"updated": region}
             elif action == "toggle":
                 region = str(payload.get("region") or "")
                 enabled = 1 if payload.get("enabled") else 0
                 if not conn.execute("SELECT 1 FROM targets WHERE region=?", (region,)).fetchone():
-                    raise ValueError("?????")
+                    raise ValueError("节点不存在")
                 conn.execute("UPDATE targets SET enabled=? WHERE region=?", (enabled, region))
                 result = {"updated": region, "enabled": bool(enabled)}
             elif action == "delete":
                 region = str(payload.get("region") or "")
                 current = conn.execute("SELECT custom FROM targets WHERE region=?", (region,)).fetchone()
                 if not current or not current["custom"]:
-                    raise ValueError("????????????????")
+                    raise ValueError("甲骨文默认节点不能删除，只能停用")
                 conn.execute("DELETE FROM results WHERE region=?", (region,))
                 conn.execute("DELETE FROM targets WHERE region=?", (region,))
                 result = {"deleted": region}
             else:
-                raise ValueError("????????")
+                raise ValueError("不支持的节点操作")
     wake_event.set()
     result.update(list_targets())
     return result
@@ -461,7 +461,7 @@ def control(action):
     elif action == "resume":
         with state_lock:
             if state.get("awaiting_project"):
-                raise ValueError("????????")
+                raise ValueError("请先选择测试项目")
             state["paused"] = False
             state["running"] = True
             duration_hours = state["duration_hours"]
@@ -491,13 +491,13 @@ def update_settings(payload):
         timeout = float(payload.get("timeout"))
         duration_hours = float(payload.get("duration_hours"))
     except (TypeError, ValueError):
-        raise ValueError("???????")
+        raise ValueError("参数必须是数字")
     if not 5 <= interval <= 86400:
-        raise ValueError("??????? 5 ? 86400 ???")
+        raise ValueError("检测间隔必须在 5 至 86400 秒之间")
     if not 0.1 <= timeout <= 120:
-        raise ValueError("??????? 0.1 ? 120 ???")
+        raise ValueError("连接超时必须在 0.1 至 120 秒之间")
     if not 0 <= duration_hours <= 8760:
-        raise ValueError("??????? 0 ? 8760 ?????0 ?????")
+        raise ValueError("采集时长必须在 0 至 8760 小时之间；0 表示不限时")
     network_label = str(payload.get("network_label", "")).strip()[:80]
     settings = {"interval": interval, "timeout": timeout, "duration_hours": duration_hours, "network_label": network_label}
     with state_lock:
@@ -516,8 +516,8 @@ def update_settings(payload):
         return dict(state)
 
 
-REGION_ZH = {"Beijing":"???","Tianjin":"???","Hebei":"???","Shanxi":"???","Inner Mongolia":"??????","Liaoning":"???","Jilin":"???","Heilongjiang":"????","Shanghai":"???","Jiangsu":"???","Zhejiang":"???","Anhui":"???","Fujian":"???","Jiangxi":"???","Shandong":"???","Henan":"???","Hubei":"???","Hunan":"???","Guangdong":"???","Guangxi":"???????","Hainan":"???","Chongqing":"???","Sichuan":"???","Guizhou":"???","Yunnan":"???","Tibet":"?????","Shaanxi":"???","Gansu":"???","Qinghai":"???","Ningxia":"???????","Xinjiang":"????????","Hong Kong":"???????","Macao":"???????","Taiwan":"???"}
-CITY_ZH = {"Dongguan":"???","Guangzhou":"???","Shenzhen":"???","Nanning":"???","Guilin":"???","Liuzhou":"???","Chongzuo":"???","Qinzhou":"???","Beihai":"???","Fangchenggang":"????","Guigang":"???","Yulin":"???","Baise":"???","Hezhou":"???","Hechi":"???","Laibin":"???","Wuzhou":"???","Beijing":"???","Shanghai":"???","Chengdu":"???","Chongqing":"???","Wuhan":"???","Changsha":"???","Hangzhou":"???","Nanjing":"???","Fuzhou":"???","Xiamen":"???"}
+REGION_ZH = {"Beijing":"北京市","Tianjin":"天津市","Hebei":"河北省","Shanxi":"山西省","Inner Mongolia":"内蒙古自治区","Liaoning":"辽宁省","Jilin":"吉林省","Heilongjiang":"黑龙江省","Shanghai":"上海市","Jiangsu":"江苏省","Zhejiang":"浙江省","Anhui":"安徽省","Fujian":"福建省","Jiangxi":"江西省","Shandong":"山东省","Henan":"河南省","Hubei":"湖北省","Hunan":"湖南省","Guangdong":"广东省","Guangxi":"广西壮族自治区","Hainan":"海南省","Chongqing":"重庆市","Sichuan":"四川省","Guizhou":"贵州省","Yunnan":"云南省","Tibet":"西藏自治区","Shaanxi":"陕西省","Gansu":"甘肃省","Qinghai":"青海省","Ningxia":"宁夏回族自治区","Xinjiang":"新疆维吾尔自治区","Hong Kong":"香港特别行政区","Macao":"澳门特别行政区","Taiwan":"台湾省"}
+CITY_ZH = {"Dongguan":"东莞市","Guangzhou":"广州市","Shenzhen":"深圳市","Nanning":"南宁市","Guilin":"桂林市","Liuzhou":"柳州市","Chongzuo":"崇左市","Qinzhou":"钦州市","Beihai":"北海市","Fangchenggang":"防城港市","Guigang":"贵港市","Yulin":"玉林市","Baise":"百色市","Hezhou":"贺州市","Hechi":"河池市","Laibin":"来宾市","Wuzhou":"梧州市","Beijing":"北京市","Shanghai":"上海市","Chengdu":"成都市","Chongqing":"重庆市","Wuhan":"武汉市","Changsha":"长沙市","Hangzhou":"杭州市","Nanjing":"南京市","Fuzhou":"福州市","Xiamen":"厦门市"}
 
 
 def direct_json(host, path, family):
@@ -548,22 +548,22 @@ def chinese_network(data, version):
     isp_raw = connection.get("isp") or connection.get("org") or data.get("org") or ""
     isp_lower = isp_raw.lower()
     if "unicom" in isp_lower or "china169" in isp_lower:
-        isp = "????"
+        isp = "中国联通"
     elif "telecom" in isp_lower or "chinanet" in isp_lower:
-        isp = "????"
+        isp = "中国电信"
     elif "mobile" in isp_lower or "cmnet" in isp_lower or "cmi" in isp_lower:
-        isp = "????"
+        isp = "中国移动"
     elif "cernet" in isp_lower:
-        isp = "?????"
+        isp = "中国教育网"
     else:
-        isp = isp_raw or "?????"
+        isp = isp_raw or "未知运营商"
     country_raw = data.get("country") or data.get("country_name") or ""
-    country = "??" if country_raw in ("China", "CN") else country_raw
+    country = "中国" if country_raw in ("China", "CN") else country_raw
     region_raw = (data.get("region") or "").replace(" Sheng", "").replace(" Zhuangzu Zizhiqu", "")
     city_raw = data.get("city") or ""
     region, city = REGION_ZH.get(region_raw, region_raw), CITY_ZH.get(city_raw, city_raw)
     parts = [x for x in (country, region, city, isp, f"IPv{version}: {public_ip}") if x]
-    return {"ip":public_ip,"isp":isp,"isp_raw":isp_raw,"asn":connection.get("asn") or data.get("asn"),"city":city,"region":region,"country":country,"display":" ? ".join(parts)}
+    return {"ip":public_ip,"isp":isp,"isp_raw":isp_raw,"asn":connection.get("asn") or data.get("asn"),"city":city,"region":region,"country":country,"display":" · ".join(parts)}
 
 
 def get_public_network():
@@ -693,29 +693,29 @@ def csv_bytes(hours):
     info = network_info()
     with state_lock:
         snapshot = dict(state)
-    writer.writerow(["Oracle TCP Monitor ????"])
-    writer.writerow(["????(??)", datetime.now().astimezone().isoformat(timespec="seconds")])
-    writer.writerow(["????", "?????????????Oracle Cloud Infrastructure???????? TCP ????"])
-    writer.writerow(["?????", info["hostname"]])
-    writer.writerow(["????", project["name"] if project else "????"])
-    writer.writerow(["???????", info["public_network"].get("custom_label") or "???"])
+    writer.writerow(["Oracle TCP Monitor 导出信息"])
+    writer.writerow(["导出时间(本地)", datetime.now().astimezone().isoformat(timespec="seconds")])
+    writer.writerow(["测试用途", "当前所在地网络到甲骨文云（Oracle Cloud Infrastructure）各区域服务器的 TCP 连接速度"])
+    writer.writerow(["计算机名称", info["hostname"]])
+    writer.writerow(["测试项目", project["name"] if project else "默认项目"])
+    writer.writerow(["自定义网络标注", info["public_network"].get("custom_label") or "未设置"])
     for key, label in (("ipv4", "IPv4"), ("ipv6", "IPv6")):
         net = info["public_network"].get(key) or {}
-        writer.writerow([f"??{label}", net.get("ip") or "????"])
-        writer.writerow([f"{label}???", net.get("isp") or "??"])
-        writer.writerow([f"{label}??", " / ".join(filter(None, (net.get("country"), net.get("region"), net.get("city")))) or "??"])
-        writer.writerow([f"{label} ASN", net.get("asn") or "??"])
-    writer.writerow(["???????IP", info["local_outbound_ip"] or "??"])
-    writer.writerow(["??IPv4", "; ".join(info["local_ips"]) or "??"])
-    writer.writerow(["??????", "????: " + ", ".join(info["proxy_variables"]) if info["proxy_environment"] else "????"])
-    writer.writerow(["????", info["target_service"]])
-    writer.writerow(["????", info["target_port"]])
-    writer.writerow(["????(??)", selected_hours])
-    writer.writerow(["????(?)", snapshot["interval"]])
-    writer.writerow(["????(?)", snapshot["timeout"]])
-    writer.writerow(["????(??)", snapshot["duration_hours"], "0 ?????"])
+        writer.writerow([f"公网{label}", net.get("ip") or "查询失败"])
+        writer.writerow([f"{label}运营商", net.get("isp") or "未知"])
+        writer.writerow([f"{label}位置", " / ".join(filter(None, (net.get("country"), net.get("region"), net.get("city")))) or "未知"])
+        writer.writerow([f"{label} ASN", net.get("asn") or "未知"])
+    writer.writerow(["本机局域网出口IP", info["local_outbound_ip"] or "未知"])
+    writer.writerow(["本地IPv4", "; ".join(info["local_ips"]) or "未知"])
+    writer.writerow(["代理环境变量", "已检测到: " + ", ".join(info["proxy_variables"]) if info["proxy_environment"] else "未检测到"])
+    writer.writerow(["目标服务", info["target_service"]])
+    writer.writerow(["目标端口", info["target_port"]])
+    writer.writerow(["统计窗口(小时)", selected_hours])
+    writer.writerow(["检测间隔(秒)", snapshot["interval"]])
+    writer.writerow(["连接超时(秒)", snapshot["timeout"]])
+    writer.writerow(["采集时长(小时)", snapshot["duration_hours"], "0 表示不限时"])
     writer.writerow([])
-    writer.writerow(["????(UTC)","????","??","??","??","??","??ms","IP","??"])
+    writer.writerow(["检测时间(UTC)","区域标识","地区","地址","端口","成功","延迟ms","IP","错误"])
     writer.writerows(rows)
     return ("\ufeff" + out.getvalue()).encode("utf-8")
 
@@ -792,8 +792,8 @@ def main():
     worker = threading.Thread(target=monitor_loop, name="tcp-monitor", daemon=True)
     worker.start()
     server = ThreadingHTTPServer((HOST, WEB_PORT), Handler)
-    print(f"Oracle TCP ????????http://{HOST}:{WEB_PORT}")
-    print(f"???? {state['interval']} ??TCP ?? {state['timeout']} ?????? {state['duration_hours']:g} ??")
+    print(f"Oracle TCP 延迟监控已启动：http://{HOST}:{WEB_PORT}")
+    print(f"检测间隔 {state['interval']} 秒，TCP 超时 {state['timeout']} 秒，计划时长 {state['duration_hours']:g} 小时")
     if os.environ.get("TCP_OPEN_BROWSER", "1") != "0":
         threading.Timer(1.0, lambda: webbrowser.open(f"http://{HOST}:{WEB_PORT}")).start()
     try:
