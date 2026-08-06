@@ -61,4 +61,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/OracleTCPMonitor_SingleFile.exe
-          body-path: CHANGELOG.md
+          body_path: CHANGELOG.md
