@@ -117,6 +117,7 @@ python app.py
 ```powershell
 python -m pip install pyinstaller
 python -m PyInstaller --noconfirm --clean --onefile `
+  --windowed `
   --name OracleTCPMonitor_SingleFile `
   --collect-all webview `
   --collect-all pythonnet `

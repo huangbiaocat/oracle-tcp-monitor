@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 import webbrowser
 import urllib.request
@@ -1109,6 +1110,12 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == "/api/status":
                 with state_lock: payload = dict(state)
                 payload["db_size_bytes"] = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+                payload["db_path"] = str(DB_PATH)
+                try:
+                    with db() as conn:
+                        payload["db_has_data"] = bool(conn.execute("SELECT 1 FROM results LIMIT 1").fetchone())
+                except Exception:
+                    payload["db_has_data"] = False
                 payload["network"] = network_info(force=want_refresh)
                 self.send_data(payload)
             elif url.path == "/api/summary":
@@ -1218,29 +1225,38 @@ def schedule_auto_exit(server, seconds):
 
 
 def main():
-    cleanup_update_files()
-    init_db()
-    worker = threading.Thread(target=monitor_loop, name="tcp-monitor", daemon=True)
-    worker.start()
-    server = ThreadingHTTPServer((HOST, WEB_PORT), Handler)
-    url = f"http://{HOST}:{WEB_PORT}"
-    print(f"Oracle TCP 延迟监控已启动：{url}")
-    print(f"检测间隔 {state['interval']} 秒，TCP 超时 {state['timeout']} 秒，计划时长 {state['duration_hours']:g} 小时")
-    server_thread = threading.Thread(target=server.serve_forever, name="http-server", daemon=True)
-    server_thread.start()
-    schedule_auto_exit(server, float(os.environ.get("TCP_EXIT_AFTER_SECONDS", "0") or 0))
     try:
-        if start_ui(server, url):
+        cleanup_update_files()
+        init_db()
+        worker = threading.Thread(target=monitor_loop, name="tcp-monitor", daemon=True)
+        worker.start()
+        server = ThreadingHTTPServer((HOST, WEB_PORT), Handler)
+        url = f"http://{HOST}:{WEB_PORT}"
+        print(f"Oracle TCP 延迟监控已启动：{url}")
+        print(f"检测间隔 {state['interval']} 秒，TCP 超时 {state['timeout']} 秒，计划时长 {state['duration_hours']:g} 小时")
+        server_thread = threading.Thread(target=server.serve_forever, name="http-server", daemon=True)
+        server_thread.start()
+        schedule_auto_exit(server, float(os.environ.get("TCP_EXIT_AFTER_SECONDS", "0") or 0))
+        try:
+            if start_ui(server, url):
+                stop_event.set()
+                server.shutdown()
+            else:
+                while not stop_event.is_set():
+                    time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+        finally:
             stop_event.set()
-            server.shutdown()
-        else:
-            while not stop_event.is_set():
-                time.sleep(0.5)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        stop_event.set()
-        server.server_close()
+            server.server_close()
+    except Exception:
+        try:
+            with open(ROOT / "oracle_tcp_error.log", "a", encoding="utf-8") as log:
+                log.write(f"\n==== {datetime.now().astimezone().isoformat(timespec='seconds')} ====\n")
+                traceback.print_exc(file=log)
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":

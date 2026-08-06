@@ -23,6 +23,7 @@ jobs:
         shell: pwsh
         run: |
           python -m PyInstaller --noconfirm --clean --onefile `
+            --windowed `
             --name OracleTCPMonitor_SingleFile `
             --collect-all webview `
             --collect-all pythonnet `
