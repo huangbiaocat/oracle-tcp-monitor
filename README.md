@@ -121,15 +121,22 @@ python -m pip install pyinstaller
 python -m PyInstaller --noconfirm --clean --onefile `
   --windowed `
   --name OracleTCPMonitor_SingleFile `
+  --upx-dir "UPX解压目录" `
   --collect-all webview `
   --collect-all pythonnet `
   --collect-all clr_loader `
+  --exclude-module tkinter --exclude-module unittest --exclude-module ensurepip `
+  --exclude-module pip --exclude-module venv --exclude-module idlelib `
+  --exclude-module turtledemo --exclude-module lib2to3 --exclude-module pydoc_data `
+  --exclude-module doctest --exclude-module webview.platforms.cocoa `
+  --exclude-module webview.platforms.gtk --exclude-module webview.platforms.qt `
+  --exclude-module webview.platforms.cef `
   --add-data "targets.json;." `
   --add-data "web\index.html;web" `
   app.py
 ```
 
-生成文件位于 `dist/OracleTCPMonitor_SingleFile.exe`。
+生成文件位于 `dist/OracleTCPMonitor_SingleFile.exe`。使用 UPX 压缩可明显减小体积（约节省 10%–20%）；`--upx-dir` 指向 UPX 解压目录（[upx/upx](https://github.com/upx/upx/releases) 下载 win64 版）。
 
 ## 数据说明
 
