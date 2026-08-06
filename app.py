@@ -36,7 +36,7 @@ except Exception:
 FROZEN = getattr(sys, "frozen", False)
 ROOT = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 ASSET_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
-APP_VERSION = "1.5.4"
+APP_VERSION = "1.5.5"
 REPO_API = "https://api.github.com/repos/huangbiaocat/oracle-tcp-monitor/releases/latest"
 UPDATE_CACHE = {"checked_at": 0.0, "data": None}
 DB_PATH = ROOT / "oracle_latency.db"
