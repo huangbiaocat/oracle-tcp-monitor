@@ -686,6 +686,7 @@ def check_update(force=False):
             "latest_version": latest,
             "latest_tag": tag,
             "release_url": data.get("html_url") or "https://github.com/huangbiaocat/oracle-tcp-monitor/releases/latest",
+            "release_notes": (data.get("body") or "").strip()[:4000],
             "asset_name": asset.get("name") if asset else None,
             "asset_url": asset.get("browser_download_url") if asset else None,
             "asset_size": asset.get("size") if asset else None,
