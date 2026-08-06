@@ -21,7 +21,7 @@ import traceback
 import uuid
 import webbrowser
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
@@ -1027,98 +1027,6 @@ def history(region, hours):
     return {"region": region, "hours": hours, "points": [dict(x) for x in rows[::step]]}
 
 
-def parse_compare_range(start, end):
-    try:
-        start_dt = datetime.fromisoformat(str(start or "").replace("Z", "+00:00"))
-        end_dt = datetime.fromisoformat(str(end or "").replace("Z", "+00:00"))
-    except ValueError:
-        start_dt = end_dt = None
-    if start_dt is None or end_dt is None or end_dt <= start_dt:
-        end_dt = datetime.now(timezone.utc)
-        start_dt = end_dt - timedelta(hours=24)
-    return start_dt.isoformat(timespec="milliseconds"), end_dt.isoformat(timespec="milliseconds")
-
-
-def compare_metrics(start=None, end=None, metric="avg"):
-    start_iso, end_iso = parse_compare_range(start, end)
-    if metric not in ("avg", "p95", "success_rate"):
-        metric = "avg"
-    with db() as conn:
-        projects = [dict(row) for row in conn.execute(
-            "SELECT id,name,network_label,detected_isp,detected_region,detected_city,last_public_ipv4,local_ssid "
-            "FROM projects ORDER BY id")]
-        regions = [dict(row) for row in conn.execute("SELECT region,name,custom FROM targets ORDER BY custom,name,region")]
-        rows = conn.execute(
-            "SELECT project_id,region,latency_ms,success FROM results "
-            "WHERE tested_at>=? AND tested_at<? ORDER BY project_id,region,tested_at",
-            (start_iso, end_iso)).fetchall()
-    buckets = {}
-    project_success = {p["id"]: [] for p in projects}
-    project_samples = {p["id"]: 0 for p in projects}
-    for row in rows:
-        key = (row["project_id"], row["region"])
-        buckets.setdefault(key, []).append(row)
-        project_samples[row["project_id"]] += 1
-        if row["success"] and row["latency_ms"] is not None:
-            project_success[row["project_id"]].append(row["latency_ms"])
-    project_out = []
-    for p in projects:
-        oks = project_success[p["id"]]
-        project_out.append({
-            **p, "records": project_samples[p["id"]], "successes": len(oks),
-            "avg_ms": round(statistics.fmean(oks), 2) if oks else None,
-            "p95_ms": round(percentile(oks, .95), 2) if oks else None,
-            "success_rate": round(len(oks) / project_samples[p["id"]] * 100, 2) if project_samples[p["id"]] else None,
-        })
-    region_out = []
-    for r in regions:
-        values = {}
-        for p in projects:
-            items = buckets.get((p["id"], r["region"]), [])
-            oks = [x["latency_ms"] for x in items if x["success"] and x["latency_ms"] is not None]
-            values[str(p["id"])] = {
-                "avg_ms": round(statistics.fmean(oks), 2) if oks else None,
-                "p95_ms": round(percentile(oks, .95), 2) if oks else None,
-                "min_ms": round(min(oks), 2) if oks else None,
-                "max_ms": round(max(oks), 2) if oks else None,
-                "jitter_ms": round(statistics.pstdev(oks), 2) if len(oks) > 1 else (0 if oks else None),
-                "success_rate": round(len(oks) / len(items) * 100, 2) if items else None,
-                "samples": len(items), "successes": len(oks),
-            }
-        region_out.append({**r, "values": values})
-
-    def sort_score(r):
-        avgs = [v["avg_ms"] for v in r["values"].values() if v["avg_ms"] is not None]
-        return (not avgs, min(avgs) if avgs else 10**9)
-    region_out.sort(key=sort_score)
-    return {"start": start_iso, "end": end_iso, "metric": metric,
-            "projects": project_out, "regions": region_out}
-
-
-def compare_csv(start=None, end=None, metric="avg"):
-    data = compare_metrics(start, end, metric)
-    metric_names = {"avg": "平均延迟", "p95": "P95 延迟", "success_rate": "成功率"}
-    out = io.StringIO()
-    writer = csv.writer(out, lineterminator="\n")
-    writer.writerow(["Oracle TCP Monitor 网络环境横向对比"])
-    writer.writerow(["开始时间(UTC)", data["start"]])
-    writer.writerow(["结束时间(UTC)", data["end"]])
-    writer.writerow(["对比指标", metric_names.get(data["metric"], data["metric"])])
-    writer.writerow([])
-    writer.writerow(["区域标识", "地区名称"] + [f"{p['name']}（{p['network_label'] or '无标注'}）" for p in data["projects"]])
-    for region in data["regions"]:
-        row = [region["region"], region["name"]]
-        for p in data["projects"]:
-            value = region["values"].get(str(p["id"])) or {}
-            if data["metric"] == "success_rate":
-                row.append(f"{value['success_rate']}%" if value.get("success_rate") is not None else "")
-            else:
-                key = data["metric"] + "_ms"
-                row.append(f"{value[key]} ms" if value.get(key) is not None else "")
-        writer.writerow(row)
-    return ("\ufeff" + out.getvalue()).encode("utf-8")
-
-
 def csv_bytes(hours):
     selected_hours, since = window_clause(hours)
     with state_lock:
@@ -1269,18 +1177,6 @@ def export_filename(hours):
     return "_".join(parts) + ".csv"
 
 
-def compare_filename(start, end):
-    start_iso, end_iso = parse_compare_range(start, end)
-
-    def local(stamp):
-        try:
-            return datetime.fromisoformat(stamp).astimezone().strftime("%Y%m%d_%H%M")
-        except ValueError:
-            return datetime.now().strftime("%Y%m%d_%H%M")
-
-    return f"oracle_tcp_对比_{local(start_iso)}-{local(end_iso)}.csv"
-
-
 def disposition(filename):
     return f"attachment; filename=\"oracle_tcp_export.csv\"; filename*=UTF-8''{quote(filename)}"
 
@@ -1338,17 +1234,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_data(export_project(q.get("project_id", [""])[0]))
             elif url.path == "/api/projects/import_files":
                 self.send_data(list_import_files())
-            elif url.path == "/api/compare":
-                self.send_data(compare_metrics(q.get("start", [""])[0], q.get("end", [""])[0], q.get("metric", ["avg"])[0]))
             elif url.path == "/api/compare/recommend":
                 nets = [x.strip() for x in q.get("networks", [""])[0].split(",") if x.strip()]
                 self.send_data(recommend_regions(nets or None))
             elif url.path == "/api/update/check":
                 self.send_data(check_update(force=want_refresh))
-            elif url.path == "/api/export_compare.csv":
-                self.send_data(compare_csv(q.get("start", [""])[0], q.get("end", [""])[0], q.get("metric", ["avg"])[0]),
-                  "text/csv; charset=utf-8",
-                  headers={"Content-Disposition": disposition(compare_filename(q.get("start", [""])[0], q.get("end", [""])[0]))})
             elif url.path == "/api/export.csv":
                 self.send_data(csv_bytes(q.get("hours", [48])[0]), "text/csv; charset=utf-8",
                   headers={"Content-Disposition": disposition(export_filename(q.get("hours", [48])[0]))})
