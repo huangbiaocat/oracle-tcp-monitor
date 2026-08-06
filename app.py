@@ -986,7 +986,11 @@ def window_clause(hours):
     return hours, since
 
 
-def summary(hours):
+def summary(hours, p=95):
+    try:
+        p = min(99, max(50, int(p)))
+    except (TypeError, ValueError):
+        p = 95
     hours, since = window_clause(hours)
     with state_lock:
         project_id = state.get("project_id", 1)
@@ -1006,14 +1010,14 @@ def summary(hours):
           "avg_ms": round(statistics.fmean(oks), 2) if oks else None,
           "min_ms": round(min(oks), 2) if oks else None,
           "max_ms": round(max(oks), 2) if oks else None,
-          "p95_ms": round(percentile(oks, .95), 2) if oks else None,
+          "p95_ms": round(percentile(oks, p / 100), 2) if oks else None,
           "jitter_ms": round(statistics.pstdev(oks), 2) if len(oks) > 1 else (0 if oks else None),
           "latest_ms": last["latency_ms"] if last and last["success"] else None,
           "latest_ok": bool(last["success"]) if last else None,
           "latest_at": last["tested_at"] if last else None,
           "ip": last["ip"] if last else None, "error": last["error"] if last else None})
     output.sort(key=lambda x: (x["avg_ms"] is None, x["avg_ms"] or 10**9, -(x["success_rate"] or 0)))
-    return {"hours": hours, "project_id": project_id, "targets": output}
+    return {"hours": hours, "project_id": project_id, "p_value": p, "targets": output}
 
 
 def history(region, hours):
@@ -1141,7 +1145,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload["network"] = network_info(force=want_refresh)
                 self.send_data(payload)
             elif url.path == "/api/summary":
-                self.send_data(summary(q.get("hours", [24])[0]))
+                self.send_data(summary(q.get("hours", [24])[0], q.get("p", [95])[0]))
             elif url.path == "/api/history":
                 self.send_data(history(q.get("region", [""])[0], q.get("hours", [24])[0]))
             elif url.path == "/api/targets":
