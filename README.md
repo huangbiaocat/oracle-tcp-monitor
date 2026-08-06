@@ -184,3 +184,7 @@ python -m PyInstaller --noconfirm --clean --onefile `
 ## 许可证
 
 [MIT](LICENSE)
+
+## 更新日志
+
+各版本更新内容见 [CHANGELOG.md](CHANGELOG.md)。
