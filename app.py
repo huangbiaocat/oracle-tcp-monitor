@@ -36,7 +36,7 @@ except Exception:
 FROZEN = getattr(sys, "frozen", False)
 ROOT = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 ASSET_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.4"
 REPO_API = "https://api.github.com/repos/huangbiaocat/oracle-tcp-monitor/releases/latest"
 UPDATE_CACHE = {"checked_at": 0.0, "data": None}
 DB_PATH = ROOT / "oracle_latency.db"
@@ -1109,6 +1109,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_data(WEB_PATH.read_bytes(), "text/html; charset=utf-8")
             elif url.path == "/api/status":
                 with state_lock: payload = dict(state)
+                payload["version"] = APP_VERSION
                 payload["db_size_bytes"] = DB_PATH.stat().st_size if DB_PATH.exists() else 0
                 payload["db_path"] = str(DB_PATH)
                 try:
