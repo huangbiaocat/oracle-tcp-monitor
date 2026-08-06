@@ -41,6 +41,7 @@ REPO_API = "https://api.github.com/repos/huangbiaocat/oracle-tcp-monitor/release
 UPDATE_CACHE = {"checked_at": 0.0, "data": None}
 DB_PATH = ROOT / "oracle_latency.db"
 SETTINGS_PATH = ROOT / "oracle_tcp_settings.json"
+EXPORT_DIR = ROOT / "导出"
 TARGETS_PATH = ASSET_ROOT / "targets.json"
 WEB_PATH = ASSET_ROOT / "web" / "index.html"
 HOST, WEB_PORT = "127.0.0.1", int(os.environ.get("TCP_PORT", "8765"))
@@ -310,6 +311,129 @@ def manage_projects(payload):
         raise ValueError("不支持的项目操作")
     wake_event.set()
     return list_projects()
+
+
+def export_project(project_id, download=False):
+    """把指定项目连同全部检测记录导出为可移植 JSON 文件，便于复制到其他电脑导入对比。"""
+    try:
+        project_id = int(project_id)
+    except (TypeError, ValueError):
+        raise ValueError("测试项目无效")
+    with db() as conn:
+        project = conn.execute(
+            "SELECT id,name,network_label,created_at,detected_isp,detected_region,detected_city,last_public_ipv4,local_ssid "
+            "FROM projects WHERE id=?", (project_id,)).fetchone()
+        if not project:
+            raise ValueError("测试项目不存在")
+        rows = [dict(r) for r in conn.execute(
+            "SELECT tested_at,region,latency_ms,success,ip,error FROM results WHERE project_id=? ORDER BY tested_at",
+            (project_id,))]
+    fields = ("name", "network_label", "created_at", "detected_isp", "detected_region",
+              "detected_city", "last_public_ipv4", "local_ssid")
+    payload = {
+        "format": "oracle-tcp-project",
+        "version": 1,
+        "exported_at": utc_now(),
+        "project": {k: project[k] for k in fields},
+        "results": rows,
+    }
+    text = json.dumps(payload, ensure_ascii=False, indent=1)
+    stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M")
+    filename = f"{safe_filename(project['name'])}_{stamp}.json"
+    if download:
+        return filename, text
+    EXPORT_DIR.mkdir(exist_ok=True)
+    path = EXPORT_DIR / filename
+    path.write_text(text, encoding="utf-8")
+    return {"saved": True, "path": str(path), "records": len(rows), "filename": filename}
+
+
+def list_import_files():
+    """列出程序目录中可导入的项目导出文件。"""
+    files = []
+    for folder in (EXPORT_DIR, ROOT):
+        if not folder.exists():
+            continue
+        for f in sorted(folder.glob("*.json")):
+            if f.name == "oracle_tcp_settings.json":
+                continue
+            try:
+                data = json.loads(f.read_text(encoding="utf-8-sig"))
+            except Exception:
+                continue
+            if not isinstance(data, dict) or data.get("format") != "oracle-tcp-project":
+                continue
+            files.append({
+                "path": str(f),
+                "name": f.name,
+                "size": f.stat().st_size,
+                "project_name": (data.get("project") or {}).get("name") or "未知",
+                "records": len(data.get("results") or []),
+                "exported_at": data.get("exported_at") or "",
+            })
+    return {"files": files}
+
+
+def import_project_file(file_path, mode="new"):
+    """把导出的项目 JSON 导入本机数据库，mode=new 新建项目，mode=merge 合并到同名项目。"""
+    path = Path(str(file_path or ""))
+    if not path.is_file():
+        raise ValueError("导入文件不存在或无法读取")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        raise ValueError("文件不是有效的 JSON 导出文件")
+    if not isinstance(data, dict) or data.get("format") != "oracle-tcp-project":
+        raise ValueError("文件不是 Oracle TCP Monitor 的项目导出文件")
+    project = data.get("project") or {}
+    name = str(project.get("name") or "").strip()[:80] or "导入项目"
+    label = str(project.get("network_label") or "").strip()[:80]
+    results = data.get("results") or []
+    mode = str(mode or "new").strip().lower()
+    if mode not in ("new", "merge"):
+        mode = "new"
+    with db() as conn:
+        if mode == "merge":
+            existing = conn.execute("SELECT id FROM projects WHERE name=?", (name,)).fetchone()
+            if not existing:
+                raise ValueError(f"没有找到同名项目“{name}”，无法合并；请改用“新建项目”导入")
+            project_id = existing["id"]
+            existing_keys = {row[0] for row in conn.execute(
+                "SELECT tested_at || '|' || region FROM results WHERE project_id=?", (project_id,))}
+            new_rows = []
+            for item in results:
+                key = f"{item.get('tested_at')}|{item.get('region')}"
+                if key in existing_keys:
+                    continue
+                existing_keys.add(key)
+                new_rows.append((item.get("tested_at"), item.get("region"), item.get("latency_ms"),
+                                 1 if item.get("success") else 0, item.get("ip"), item.get("error")))
+            conn.executemany(
+                "INSERT INTO results(tested_at,region,latency_ms,success,ip,error,project_id) VALUES(?,?,?,?,?,?,?)",
+                [(*row, project_id) for row in new_rows])
+            added = len(new_rows)
+        else:
+            base_name = name
+            index = 2
+            while conn.execute("SELECT 1 FROM projects WHERE name=?", (name,)).fetchone():
+                name = f"{base_name}（副本{index}）"
+                index += 1
+            cursor = conn.execute(
+                "INSERT INTO projects(name,network_label,created_at,detected_isp,detected_region,detected_city,last_public_ipv4,local_ssid) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (name, label, project.get("created_at") or utc_now(), project.get("detected_isp"),
+                 project.get("detected_region"), project.get("detected_city"), project.get("last_public_ipv4"),
+                 project.get("local_ssid")))
+            project_id = cursor.lastrowid
+            rows = [(item.get("tested_at"), item.get("region"), item.get("latency_ms"),
+                     1 if item.get("success") else 0, item.get("ip"), item.get("error"), project_id)
+                    for item in results]
+            conn.executemany(
+                "INSERT INTO results(tested_at,region,latency_ms,success,ip,error,project_id) VALUES(?,?,?,?,?,?,?)",
+                rows)
+            added = len(rows)
+    wake_event.set()
+    return {"imported": True, "project_id": project_id, "project_name": name, "added": added, **list_projects()}
 
 
 def save_current_settings():
@@ -1127,6 +1251,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_data(list_targets())
             elif url.path == "/api/projects":
                 self.send_data(list_projects(refresh=want_refresh))
+            elif url.path == "/api/projects/export":
+                if q.get("download", ["0"])[0].lower() in ("1", "true", "yes", "on"):
+                    filename, text = export_project(q.get("project_id", [""])[0], download=True)
+                    self.send_data(text, "application/json; charset=utf-8",
+                                   headers={"Content-Disposition": disposition(filename)})
+                else:
+                    self.send_data(export_project(q.get("project_id", [""])[0]))
+            elif url.path == "/api/projects/import_files":
+                self.send_data(list_import_files())
             elif url.path == "/api/compare":
                 self.send_data(compare_metrics(q.get("start", [""])[0], q.get("end", [""])[0], q.get("metric", ["avg"])[0]))
             elif url.path == "/api/update/check":
@@ -1146,7 +1279,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urlparse(self.path)
         try:
-            if url.path not in ("/api/control", "/api/settings", "/api/targets", "/api/projects", "/api/update/apply"):
+            if url.path not in ("/api/control", "/api/settings", "/api/targets", "/api/projects",
+                                "/api/projects/import", "/api/update/apply"):
                 self.send_data({"error":"not found"}, status=404)
                 return
             length = min(4096, int(self.headers.get("Content-Length", "0")))
@@ -1159,6 +1293,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_data(manage_targets(payload))
             elif url.path == "/api/projects":
                 self.send_data(manage_projects(payload))
+            elif url.path == "/api/projects/import":
+                self.send_data(import_project_file(payload.get("file_path"), payload.get("mode", "new")))
             else:
                 self.send_data(control(payload.get("action")))
         except (ValueError, json.JSONDecodeError) as exc:
