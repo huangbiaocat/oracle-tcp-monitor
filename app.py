@@ -1160,6 +1160,84 @@ def csv_bytes(hours):
     return ("\ufeff" + out.getvalue()).encode("utf-8")
 
 
+NETWORK_KEYS = (("电信", "中国电信"), ("联通", "中国联通"), ("移动", "中国移动"), ("教育", "中国教育网"))
+
+
+def normalize_network(name):
+    name = str(name or "").strip()
+    for key, full in NETWORK_KEYS:
+        if key in name:
+            return full
+    return "其他"
+
+
+def recommend_regions(networks=None):
+    """按网络环境分组，输出各网络区域排行 + 多网络组合推荐（全量数据对比）。"""
+    with db() as conn:
+        projects = [dict(r) for r in conn.execute(
+            "SELECT id,name,detected_isp,network_label FROM projects")]
+        rows = conn.execute("SELECT project_id,region,latency_ms,success FROM results").fetchall()
+        targets = {r["region"]: r["name"] for r in conn.execute("SELECT region,name FROM targets")}
+    groups = {}
+    for project in projects:
+        net = normalize_network(f"{project.get('detected_isp') or ''} {project.get('network_label') or ''}")
+        groups.setdefault(net, []).append(project)
+    net_stats = {}
+    for net, project_list in groups.items():
+        pids = {p["id"] for p in project_list}
+        per_region = {}
+        for row in rows:
+            if row["project_id"] in pids:
+                per_region.setdefault(row["region"], []).append(row)
+        region_list = []
+        for region, items in per_region.items():
+            oks = [x["latency_ms"] for x in items if x["success"] and x["latency_ms"] is not None]
+            if not oks:
+                continue
+            region_list.append({
+                "region": region,
+                "name": targets.get(region, region),
+                "avg_ms": round(statistics.fmean(oks), 2),
+                "p95_ms": round(percentile(oks, .95), 2),
+                "success_rate": round(len(oks) / len(items) * 100, 2),
+                "samples": len(items),
+            })
+        region_list.sort(key=lambda x: x["avg_ms"])
+        for i, item in enumerate(region_list, 1):
+            item["rank"] = i
+        net_stats[net] = {"isp": net, "projects": [p["name"] for p in project_list], "regions": region_list}
+    if networks:
+        selected = []
+        for name in networks:
+            full = normalize_network(name)
+            if full in net_stats and full not in selected:
+                selected.append(full)
+    else:
+        selected = [n for n in ("中国电信", "中国移动", "中国联通", "中国教育网", "其他") if n in net_stats]
+    combo = None
+    if len(selected) >= 2:
+        common = None
+        by_region = {}
+        for net in selected:
+            avgs = {r["region"]: r for r in net_stats[net]["regions"]}
+            by_region[net] = avgs
+            keys = set(avgs)
+            common = keys if common is None else (common & keys)
+        combo_regions = []
+        for region in common:
+            entry = {"region": region, "name": targets.get(region, region), "per_net": {}}
+            for net in selected:
+                entry["per_net"][net] = by_region[net][region]["avg_ms"]
+            entry["max_ms"] = max(entry["per_net"].values())
+            entry["avg_ms"] = round(statistics.fmean(list(entry["per_net"].values())), 2)
+            combo_regions.append(entry)
+        combo_regions.sort(key=lambda x: (x["max_ms"], x["avg_ms"]))
+        for i, item in enumerate(combo_regions, 1):
+            item["rank"] = i
+        combo = {"networks": selected, "regions": combo_regions}
+    return {"networks": net_stats, "combination": combo}
+
+
 def safe_filename(text):
     cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", str(text or ""))
     cleaned = re.sub(r"\s+", "_", cleaned).strip("._")
@@ -1262,6 +1340,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_data(list_import_files())
             elif url.path == "/api/compare":
                 self.send_data(compare_metrics(q.get("start", [""])[0], q.get("end", [""])[0], q.get("metric", ["avg"])[0]))
+            elif url.path == "/api/compare/recommend":
+                nets = [x.strip() for x in q.get("networks", [""])[0].split(",") if x.strip()]
+                self.send_data(recommend_regions(nets or None))
             elif url.path == "/api/update/check":
                 self.send_data(check_update(force=want_refresh))
             elif url.path == "/api/export_compare.csv":
