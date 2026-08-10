@@ -36,7 +36,7 @@ except Exception:
 FROZEN = getattr(sys, "frozen", False)
 ROOT = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 ASSET_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
-APP_VERSION = "1.5.8"
+APP_VERSION = "1.5.9"
 REPO_API = "https://api.github.com/repos/huangbiaocat/oracle-tcp-monitor/releases/latest"
 UPDATE_CACHE = {"checked_at": 0.0, "data": None}
 DB_PATH = ROOT / "oracle_latency.db"
@@ -979,11 +979,30 @@ def percentile(values, p):
 
 def window_clause(hours):
     try:
-        hours = min(720.0, max(0.1, float(hours)))
+        hours = float(hours)
     except (TypeError, ValueError):
         hours = 24.0
+    if hours <= 0:
+        return 0.0, None
+    hours = min(720.0, max(0.1, hours))
     since = datetime.fromtimestamp(time.time() - hours * 3600, timezone.utc).isoformat(timespec="milliseconds")
     return hours, since
+
+
+def project_window_rows(conn, columns, project_id, since, *, region=None, joins=""):
+    """Read either a bounded time window or every retained row for one project."""
+    conditions = ["r.project_id=?"]
+    params = [project_id]
+    if region is not None:
+        conditions.insert(0, "r.region=?")
+        params.insert(0, region)
+    if since is not None:
+        conditions.insert(-1, "r.tested_at>=?")
+        params.insert(-1, since)
+    return conn.execute(
+        f"SELECT {columns} FROM results r {joins} WHERE {' AND '.join(conditions)} ORDER BY r.tested_at",
+        params,
+    ).fetchall()
 
 
 def summary(hours, p=95):
@@ -996,7 +1015,7 @@ def summary(hours, p=95):
         project_id = state.get("project_id", 1)
     with db() as conn:
         targets = [dict(x) for x in conn.execute("SELECT * FROM targets ORDER BY region")]
-        rows = conn.execute("SELECT region,latency_ms,success,tested_at,ip,error FROM results WHERE tested_at>=? AND project_id=? ORDER BY tested_at", (since, project_id)).fetchall()
+        rows = project_window_rows(conn, "r.region,r.latency_ms,r.success,r.tested_at,r.ip,r.error", project_id, since)
     grouped = {t["region"]: [] for t in targets}
     for row in rows:
         grouped.setdefault(row["region"], []).append(dict(row))
@@ -1025,8 +1044,7 @@ def history(region, hours):
     with state_lock:
         project_id = state.get("project_id", 1)
     with db() as conn:
-        rows = conn.execute("""SELECT tested_at,latency_ms,success FROM results
-          WHERE region=? AND tested_at>=? AND project_id=? ORDER BY tested_at""", (region, since, project_id)).fetchall()
+        rows = project_window_rows(conn, "r.tested_at,r.latency_ms,r.success", project_id, since, region=region)
     # Cap chart payload while preserving the full database.
     step = max(1, math.ceil(len(rows) / 1200))
     return {"region": region, "hours": hours, "points": [dict(x) for x in rows[::step]]}
@@ -1038,9 +1056,13 @@ def csv_bytes(hours):
         project_id = state.get("project_id", 1)
     with db() as conn:
         project = conn.execute("SELECT name FROM projects WHERE id=?", (project_id,)).fetchone()
-        rows = conn.execute("""SELECT r.tested_at,r.region,t.name,t.host,t.port,r.success,r.latency_ms,r.ip,r.error
-          FROM results r JOIN targets t ON t.region=r.region WHERE r.tested_at>=? AND r.project_id=?
-          ORDER BY r.tested_at,r.region""", (since, project_id)).fetchall()
+        rows = project_window_rows(
+            conn,
+            "r.tested_at,r.region,t.name,t.host,t.port,r.success,r.latency_ms,r.ip,r.error",
+            project_id,
+            since,
+            joins="JOIN targets t ON t.region=r.region",
+        )
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\n")
     info = network_info()
@@ -1063,7 +1085,7 @@ def csv_bytes(hours):
     writer.writerow(["代理环境变量", "已检测到: " + ", ".join(info["proxy_variables"]) if info["proxy_environment"] else "未检测到"])
     writer.writerow(["目标服务", info["target_service"]])
     writer.writerow(["目标端口", info["target_port"]])
-    writer.writerow(["统计窗口(小时)", selected_hours])
+    writer.writerow(["统计窗口", "全部历史" if selected_hours == 0 else f"最近 {selected_hours:g} 小时"])
     writer.writerow(["检测间隔(秒)", snapshot["interval"]])
     writer.writerow(["连接超时(秒)", snapshot["timeout"]])
     writer.writerow(["采集时长(小时)", snapshot["duration_hours"], "0 表示不限时"])
@@ -1086,10 +1108,8 @@ def export_filename(hours):
         project_id = state.get("project_id", 1)
     with db() as conn:
         project = conn.execute("SELECT name,network_label FROM projects WHERE id=?", (project_id,)).fetchone()
-        stamps = [row[0] for row in conn.execute(
-            "SELECT tested_at FROM results WHERE tested_at>=? AND project_id=? ORDER BY tested_at",
-            (since, project_id))]
-    start_stamp = stamps[0] if stamps else since
+        stamps = [row[0] for row in project_window_rows(conn, "r.tested_at", project_id, since)]
+    start_stamp = stamps[0] if stamps else (since or utc_now())
     end_stamp = stamps[-1] if stamps else utc_now()
 
     def local(stamp):
